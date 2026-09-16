@@ -4,18 +4,23 @@
     python sync.py status              # 看有哪些未提交改动
     python sync.py pull                # 拉取最新优化（含好友提交的）
     python sync.py push -m "新增XX规则"  # 提交并推送本地优化
-    python sync.py auto -m "说明"       # 先拉后推（日常最常用）
-    python sync.py remote <仓库地址>     # 首次绑定云端仓库
+    python sync.py auto -m "说明"       # 日常最常用：先提交 -> 再拉 -> 再推
+    python sync.py remote <仓库地址>     # 首次绑定 / 切换云端仓库
     python sync.py log                 # 看最近提交
 
 设计要点：
   * 自动探测 git（WorkBuddy 自带 PortableGit，不要求系统装 git）
-  * 推送前会拦截被误加的敏感文件（.edge-auto / out / .probe/libs）
-  * 拉取后发现 requirements.txt 有变化 -> 提醒重跑 setup_env.py
+  * 推送前拦截被误加的敏感文件（.edge-auto / out / .probe/libs）
+  * 拉取后发现 requirements.txt 变化 -> 提醒重跑 setup_env.py
+  * **本环境适配 1**：本机 git 写 refs/remotes/** 会静默失败
+    （rc=0 但文件不落盘）-> fetch 后按 FETCH_HEAD 手工补齐（heal_remote_ref）。
+  * **本环境适配 2**：不用 --autostash（本机会报 "Cannot autostash"）-> 改为
+    「先提交本地改动，再拉取」，rebase 时工作区天然干净。
 """
 import os
 import subprocess
 import sys
+import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -39,7 +44,6 @@ def find_git():
               "/usr/bin/git", "/usr/local/bin/git"):
         if os.path.exists(p):
             cands.append(p)
-    # 排一下版本号，取最新的 PortableGit
     cands.sort(reverse=True)
     for c in cands:
         return c
@@ -74,6 +78,8 @@ def run(args, capture=True, check=False):
     return p.returncode, out.strip()
 
 
+# ---------------------------------------------------------------- 基础查询
+
 def have_repo():
     rc, _ = run(["rev-parse", "--is-inside-work-tree"])
     return rc == 0
@@ -83,6 +89,78 @@ def have_remote():
     rc, out = run(["remote"])
     return rc == 0 and bool(out.strip())
 
+
+def current_branch():
+    rc, out = run(["branch", "--show-current"])
+    return out.strip() or "main"
+
+
+def is_dirty():
+    rc, out = run(["status", "--porcelain"])
+    return bool(out.strip())
+
+
+def _git_dir():
+    rc, out = run(["rev-parse", "--git-dir"])
+    if rc != 0 or not out.strip():
+        return os.path.join(BASE, ".git")
+    p = out.strip()
+    return p if os.path.isabs(p) else os.path.join(BASE, p)
+
+
+# ---------------------------------------------------------------- 环境适配
+
+def heal_remote_ref(branch=None, verbose=True):
+    """本机 git 写 `refs/remotes/**` 会**静默失败**：
+    `git update-ref refs/remotes/origin/main <sha>` 返回 0，但文件不落盘
+    （`refs/heads/*` 一切正常）。后果是 `git status` 显示
+    `origin/main [gone]`、`git rebase origin/main` 找不到上游。
+
+    实测结论：**直接写 ref 文件是好的**，所以这里按 FETCH_HEAD 把引用补上。
+    返回 True 表示本次做了修正。
+    """
+    branch = branch or current_branch()
+    gd = _git_dir()
+    fh = os.path.join(gd, "FETCH_HEAD")
+    if not os.path.exists(fh):
+        return False
+    sha = ""
+    try:
+        with open(fh, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # 形如：<sha>\t\tbranch 'main' of https://github.com/...
+                if "branch '%s'" % branch in line:
+                    sha = line.split("\t", 1)[0].strip()
+                    break
+    except Exception:
+        return False
+    if not sha:
+        return False
+
+    tgt = os.path.join(gd, "refs", "remotes", "origin", branch)
+    cur = ""
+    if os.path.exists(tgt):
+        try:
+            cur = open(tgt, encoding="utf-8").read().strip()
+        except Exception:
+            cur = ""
+    if cur == sha:
+        return False
+    try:
+        os.makedirs(os.path.dirname(tgt), exist_ok=True)
+        with open(tgt, "w", encoding="utf-8") as f:
+            f.write(sha + "\n")
+    except Exception as e:
+        if verbose:
+            print("  [环境适配] 修正远端跟踪引用失败：%s" % e)
+        return False
+    if verbose:
+        print("  [环境适配] 已补齐远端跟踪引用 origin/%s -> %s"
+              "（本机 git 写该路径静默失败）" % (branch, sha[:8]))
+    return True
+
+
+# ---------------------------------------------------------------- 仓库/提交
 
 def ensure_repo():
     if not have_repo():
@@ -97,19 +175,54 @@ def show_forbidden():
     rc, out = run(["diff", "--cached", "--name-only"])
     if rc != 0 or not out:
         return []
-    bad = [f for f in out.splitlines()
-           if f.replace("\\", "/").lstrip("./").startswith(FORBIDDEN)]
-    return bad
+    return [f for f in out.splitlines()
+            if f.replace("\\", "/").lstrip("./").startswith(FORBIDDEN)]
 
+
+def read_req():
+    try:
+        with open(os.path.join(BASE, "requirements.txt"), encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def commit_local(msg=None, quiet=False):
+    """有改动就暂存并提交。返回是否产生了新提交。"""
+    if not is_dirty():
+        if not quiet:
+            print("本地没有新改动。")
+        return False
+    run(["add", "-A"], check=True)
+    bad = show_forbidden()
+    if bad:
+        hr("⛔ 拒绝提交：暂存区含敏感文件")
+        for b in bad:
+            print("   %s" % b)
+        print()
+        print("这些文件含登录态 / 达人微信号 / 大体积依赖，绝不能上传。")
+        print("请先：  git reset")
+        return False
+    hr("📝 提交本地优化")
+    if not msg:
+        msg = "sync: %s" % time.strftime("%Y-%m-%d %H:%M")
+    rc, out = run(["commit", "-m", msg])
+    print(out or "(无输出)")
+    return rc == 0
+
+
+# ---------------------------------------------------------------- 子命令
 
 def cmd_status():
     ensure_repo()
+    heal_remote_ref(verbose=False)
     hr("🔍 同步状态")
     rc, out = run(["status", "-sb"])
     print(out or "(干净)")
     rc, rem = run(["remote", "-v"])
     print()
-    print("远端：" + (rem.splitlines()[0] if rem.strip() else "❌ 未配置 -> python sync.py remote <地址>"))
+    print("远端：" + (rem.splitlines()[0] if rem.strip()
+                    else "❌ 未配置 -> python sync.py remote <地址>"))
     bad = show_forbidden()
     if bad:
         print()
@@ -123,9 +236,24 @@ def cmd_pull():
     if not have_remote():
         print("❌ 还没配置远端。先跑：  python sync.py remote <仓库地址>")
         return 1
+    if is_dirty():
+        print("⚠️ 工作区有未提交改动，rebase 需要干净工作区。")
+        print("   先提交：  python sync.py push -m \"说明\"")
+        print("   或一步到位：  python sync.py auto -m \"说明\"")
+        return 1
     before = read_req()
+    br = current_branch()
     hr("⬇️  拉取云端最新优化")
-    rc, out = run(["pull", "--rebase", "--autostash"])
+    rc, out = run(["fetch", "origin"])
+    print(out or "(无输出)")
+    if rc != 0:
+        print()
+        print("⚠️ 拉取失败，常见原因：")
+        print("   * 凭据失效 -> 跑一次 git fetch，按提示在浏览器里授权")
+        print("   * 网络不通（GitHub 在国内可能较慢）")
+        return rc
+    heal_remote_ref(br)
+    rc, out = run(["rebase", "origin/%s" % br])
     print(out or "(无输出)")
     if rc != 0:
         print()
@@ -142,13 +270,30 @@ def cmd_pull():
     return 0
 
 
-def read_req():
-    p = os.path.join(BASE, "requirements.txt")
-    try:
-        with open(p, encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return ""
+def _push_only():
+    if not have_remote():
+        print("❌ 还没配置远端。先跑：  python sync.py remote <仓库地址>")
+        return 1
+    bad = show_forbidden()
+    if bad:
+        hr("⛔ 拒绝推送：暂存区含敏感文件")
+        for b in bad:
+            print("   %s" % b)
+        print()
+        print("请先：  git reset")
+        return 1
+    hr("⬆️  推送到云端")
+    rc, out = run(["push"])
+    print(out or "(无输出)")
+    if rc == 0:
+        # push 后 git 会更新远端跟踪引用，本机该写入同样静默失败 -> 手工补齐
+        heal_remote_ref(verbose=False)
+    else:
+        print()
+        print("⚠️ 推送失败，常见原因：")
+        print("   * 云端有新提交 -> 先跑  python sync.py pull  再 push")
+        print("   * 没登录 -> 首次推送需在浏览器里授权一次")
+    return rc
 
 
 def cmd_push(msg=None):
@@ -156,44 +301,23 @@ def cmd_push(msg=None):
     if not have_remote():
         print("❌ 还没配置远端。先跑：  python sync.py remote <仓库地址>")
         return 1
-    bad = show_forbidden()
-    if bad:
-        hr("⛔ 拒绝提交：暂存区含敏感文件")
-        for b in bad:
-            print("   %s" % b)
-        print()
-        print("这些文件含登录态 / 达人微信号 / 大体积依赖，绝不能上传。")
-        print("请先：  git reset")
-        return 1
-
-    rc, out = run(["status", "--porcelain"])
-    if out.strip():
-        hr("📝 提交本地优化")
-        run(["add", "-A"], check=True)
-        if not msg:
-            msg = "sync: %s" % __import__("time").strftime("%Y-%m-%d %H:%M")
-        rc, out = run(["commit", "-m", msg])
-        print(out or "(无输出)")
-    else:
-        print("本地没有新改动。")
-
-    hr("⬆️  推送到云端")
-    rc, out = run(["push"])
-    print(out or "(无输出)")
-    if rc != 0:
-        print()
-        print("⚠️ 推送失败，常见原因：")
-        print("   * 云端有新提交 -> 先跑  python sync.py pull  再 push")
-        print("   * 没登录 -> 首次推送会要求输入账号/令牌")
-    return rc
+    commit_local(msg)
+    return _push_only()
 
 
 def cmd_auto(msg=None):
+    """先提交 -> 再拉 -> 再推。顺序很重要：先提交，rebase 就不需要 autostash。"""
+    ensure_repo()
+    if not have_remote():
+        print("❌ 还没配置远端。先跑：  python sync.py remote <仓库地址>")
+        return 1
+    commit_local(msg)
+    print()
     rc = cmd_pull()
     if rc != 0:
         return rc
     print()
-    return cmd_push(msg)
+    return _push_only()
 
 
 def cmd_remote(url):
@@ -235,11 +359,10 @@ def main():
     elif cmd == "auto":
         sys.exit(cmd_auto(msg))
     elif cmd == "remote":
-        if "--url" not in a and len(a) < 2:
+        if len(a) < 2:
             print(__doc__)
             sys.exit(1)
-        url = a[-1]
-        cmd_remote(url)
+        cmd_remote(a[-1])
     elif cmd == "log":
         cmd_log()
     else:
