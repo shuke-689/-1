@@ -110,8 +110,18 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 
 **前置（必须逐条确认，缺一不可）**
 
+0. **`out/collect/darens.json` 存在** —— `run()` 硬依赖它，缺了会直接抛
+   `FileNotFoundError`。阶段A没跑出正式名单时用归档救急：
+   ```bash
+   "$PY" .probe/build_candidates_from_archive.py            # 先看报告
+   "$PY" .probe/build_candidates_from_archive.py --write    # 写出 darens.json
+   ```
+   它会从 `out/collect/archive/darens_*.json` 按**现行规则**复检、剔除已处理台账、
+   按微信号去重，默认取 10 个（配 `CAND_LIMIT` 调整）。
+   ⚠️ 用归档数据前**必须告诉用户这批不是正式名单**并取得同意 —— 发好友申请不可撤销。
 1. 微信已登录；
 2. **「添加朋友」窗口已打开**（用户手动：微信左下角「+」→「添加朋友」）；
+   用只读枚举确认：`win_io.list_windows()` 里应出现标题 `添加朋友`。
 3. 微信没被最大化的 Edge 完全遮挡。
 
 **执行**
