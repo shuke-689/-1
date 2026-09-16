@@ -149,6 +149,17 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 `wechat_add.py` 自带**多轮台账**（`out/wechat/add_results.json`），
 `run` 会跳过已完成达人、从断点继续，不会重复处理。
 
+**台账状态**（字段名是 `add_status`）：`sent` / `already` / `excluded` / `not_found` /
+`risk_control` / `error`。`DONE_STATUS = ("sent","already","excluded","not_found")`
+**不含 `error`** → 出错那条下轮会自动重试，别手工删。
+
+**收尾报告**：跑完必报 `sent / error / not_found / already / risk_control` 各多少 + 成功清单。
+
+⚠️ `read_result()` 用的是 **桌面区域截图**（`win_io.screenshot_region`）——
+微信窗口被最大化窗口完全遮挡会读错（实测 10 个里崩 1 个）。
+`shot()` 已加固：窗口 rect 为 0x0 时 `refresh()` + `set_foreground()` 重试 4 次，
+失败给明确报错而不是 `cannot write empty image`。
+
 ## 4. 多人协作与同步（本技能的核心增量）
 
 设计：**整个项目 = 一个 git 仓库**，本技能就在仓库内，
