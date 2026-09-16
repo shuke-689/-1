@@ -798,9 +798,22 @@ def main():
 
             返回 (是否已登录, 诊断串)。
             """
-            b = _body_of(page, tries=5)
-            hit = [m for m in LOGGED_IN_MARK if m in b]
+            nonlocal page       # 主页面可能被站点/用户关掉，需要改指向
+            # 首次检查：**遍历所有标签页**（主页面可能已被关掉，只看它会误判未登录）
+            hitpg, hit = _scan_pages()
             if hit:
+                try:
+                    alive = (page is not None) and (not page.is_closed())
+                except Exception:
+                    alive = False
+                if not alive and hitpg is not None:
+                    # 主页面没了 -> 把主页面改指向那个活着且已登录的页面
+                    try:
+                        hitpg.goto(DAREN, wait_until="domcontentloaded", timeout=90_000)
+                        time.sleep(6)
+                    except Exception as e:
+                        log("   ⚠️ 回到达人广场失败：%s" % str(e)[:80])
+                    page = hitpg
                 return True, "已登录（命中 %s）" % "/".join(hit)
             if LOGIN_WAIT_SEC <= 0:
                 return False, "未登录，且 LOGIN_WAIT_SEC=0（按设置不等待）"
@@ -848,10 +861,11 @@ def main():
 
             t0 = time.time()
             n = 0
+            fails = 0                   # 连续复核失败次数
             while time.time() - t0 < LOGIN_WAIT_SEC:
                 time.sleep(LOGIN_POLL_SEC)
                 n += 1
-                _hitpg, hit = _scan_pages()
+                hitpg, hit = _scan_pages()
                 if not hit:
                     if n % 12 == 0:         # 约每分钟报一次
                         log("   …仍在等待手动登录（已等 %d/%d 秒）"
@@ -859,17 +873,41 @@ def main():
                     continue
                 log("✅ 检测到已登录（命中 %s），等了 %d 秒，继续采集。"
                     % ("/".join(hit), int(time.time() - t0)))
-                # 登录常在新标签页完成 -> 回到达人广场复核一次再往下走
-                try:
-                    page.goto(DAREN, wait_until="domcontentloaded", timeout=90_000)
-                    time.sleep(6)
-                    b2 = _body_of(page)
-                    if any(m in b2 for m in LOGGED_IN_MARK):
-                        log("   已回到达人广场，复核通过。")
-                        return True, "已登录"
-                    log("   ⚠️ 达人广场复核未通过，继续等待……")
-                except Exception as e:
-                    log("   复核时出错（忽略，继续等）：%s" % str(e)[:100])
+                # 登录常在新标签页完成 -> 回到达人广场复核一次再往下走。
+                # ⚠️ 复核必须用「**刚检测到登录的那个页面 hitpg**」，
+                #    不能用主页面 page —— 它可能已经被站点/用户关掉了。
+                #    踩过：page 已关闭 -> goto 报 "Target page ... has been closed"
+                #    -> 每 5 秒重来一次，**空转十几分钟不出结果**。
+                vp = hitpg
+                if vp is not None:
+                    try:
+                        vp.goto(DAREN, wait_until="domcontentloaded", timeout=90_000)
+                        time.sleep(6)
+                        b2 = _body_of(vp)
+                        if any(m in b2 for m in LOGGED_IN_MARK):
+                            log("   已回到达人广场，复核通过。")
+                            try:
+                                if page.is_closed():
+                                    page = vp
+                            except Exception:
+                                page = vp
+                            return True, "已登录"
+                        log("   ⚠️ 达人广场复核未通过（第 %d 次），继续等待……" % (fails + 1))
+                    except Exception as e:
+                        log("   复核时出错（第 %d 次）：%s" % (fails + 1, str(e)[:90]))
+                fails += 1
+                if fails >= 5:
+                    # 登录标记反复出现却复核不了（页面被关/被站点接管）：
+                    # **绝不能再空转** —— 直接把主页面改指向那个活着的页面继续；
+                    # 万一页面内容不对，后面类目筛选会走退出码 2 让驱动层重试
+                    # （那时登录态已持久化，重试用的是同一个 profile）。
+                    log("   ⚠️ 连续 %d 次复核失败，但登录标记反复出现 -> 直接继续" % fails)
+                    try:
+                        if page.is_closed():
+                            page = vp
+                    except Exception:
+                        page = vp
+                    return True, "已登录（复核未通过，直接继续）"
                 t0 = time.time()        # 复核没过 -> 重新计时
             _shot_all("login_timeout")
             return False, "等待 %d 秒仍未检测到登录" % LOGIN_WAIT_SEC
