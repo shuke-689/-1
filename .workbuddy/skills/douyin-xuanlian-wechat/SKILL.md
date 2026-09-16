@@ -43,16 +43,26 @@ source tools/env.sh        # 自动探测 Python / PYTHONPATH / git，跨机器�
 
 **不要**主动去跑 `login.py`。直接启动采集即可 —— 采集器自己会判断登录态：
 - 已登录 → 直接开筛；
-- 未登录 → **不中止**，在日志里打印提示，然后**停在原地等你手动登录**
-  （会话存进 `.edge-auto/profile`，之后长期有效），检测到就自动继续。
+- 未登录 → **不中止**，会**主动在浏览器里新开一个标签页打开官方登录页**
+  `https://buyin.jinritemai.com/login` 并 `bring_to_front()`，
+  然后停在原地等你手动登录（会话存进 `.edge-auto/profile`，之后长期有效），
+  检测到就自动继续。
 
 所以要做的只有一件事：**采集启动后，如果日志出现「当前未登录精选联盟」，
 就在它已经打开的那个 Edge 窗口里自己登录一下**（扫码 / 账号密码都行）。
+⚠️ 必须在**自动化那个 Edge 窗口**里登，在你自己平时用的浏览器里登是没用的
+（cookie 不在 `.edge-auto/profile`）。
+
+为什么主动新开登录页：实测在抖音电商 marketing 落地页上**点「登录」不出二维码**，
+使用者对着落地页会找不到入口。
 
 等待上限由 `LOGIN_WAIT_SEC` 控制（默认 600 秒，可按需调大）：
 ```bash
-export LOGIN_WAIT_SEC=1800    # 给足扫码时间
+export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 ```
+轮询是**遍历所有标签页**的（登录常在新标签页完成），命中后会 `goto` 回
+`daren-square` 复核一次再继续。
+
 `login.py` 仍保留，但只是**可选辅助**（想在另一个终端先扫码时用），
 不再是流程前置条件：`"$PY" login.py --check` / `"$PY" login.py`。
 
@@ -166,7 +176,8 @@ export LOGIN_WAIT_SEC=1800    # 给足扫码时间
 
 | 症状 | 真因 / 动作 |
 |---|---|
-| 日志出现「当前未登录精选联盟」 | **正常等待态**，不是报错 → 让用户去 Edge 窗口里手动登录；等满 `LOGIN_WAIT_SEC` 会退出码 3 |
+| 日志出现「当前未登录精选联盟」 | **正常等待态**，不是报错 → 它已自动打开登录页，让用户去那个 Edge 窗口登录；等满 `LOGIN_WAIT_SEC` 会退出码 3 |
+| 等满仍没登录 | 用户在机器旁吗？加大 `LOGIN_WAIT_SEC` 重跑；诊断截图看 `out/collect/need_login*_*.png` / `login_timeout*_*.png` |
 | 「未找到类目按钮」 | ①页面布局变化 ②极少数情况下登录态判定漏判 → 看 `out/collect/need_login*.png` |
 | 「未找到相关达人，请调整筛选后重试」 | **平台限流**，看返回 `code:11001`；冷却后重试，别改筛选逻辑 |
 | 每个达人主页都报 `Execution context was destroyed` | 浏览器假死（常见于系统休眠后）→ 脚本会自动 `restart_browser()`；**但重启不恢复登录** |

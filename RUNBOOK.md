@@ -48,21 +48,25 @@ PY="/c/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.ex
 
 **不再把 `login.py` 作为流程前置。** 采集器自己判断登录态：
 - 已登录 → 直接开筛；
-- 未登录 → **不中止**，日志打印「当前未登录精选联盟」，然后**停在原地等使用者
-  自己在它已经打开的 Edge 窗口里登录**，检测到就自动继续（登录常在新标签页完成，
-  命中后会 `goto` 回 `daren-square` 复核一次再往下走）。
+- 未登录 → **不中止**，会**主动 `ctx.new_page()` 打开官方登录页
+  `https://buyin.jinritemai.com/login` 并 `bring_to_front()`**（实测在 marketing
+  落地页上点「登录」不出二维码，所以直接送人到登录页），然后**停在原地等使用者
+  自己在那个 Edge 窗口里登录**；轮询是**遍历所有标签页**的（登录常在新标签页完成），
+  命中后会 `goto` 回 `daren-square` 复核一次再往下走。
 
 ```bash
-export LOGIN_WAIT_SEC=1800      # 等待上限（秒），默认 600；设 0 = 不等待，直接退出码 3
+export LOGIN_WAIT_SEC=7200      # 等待上限（秒），默认 600；设 0 = 不等待，直接退出码 3
 export LOGIN_POLL_SEC=5         # 轮询间隔（秒）
+export LOGIN_URL=https://buyin.jinritemai.com/login   # 可覆盖登录页地址
 ```
 
 - 判定依据：登录后页面正文必含「主推类目」「找达人」「按商品找达人」。
 - 登录过期后 `daren-square` 会跳到**抖音电商公开落地页**（右上角「登录」），
   采集器只表现为「**未找到类目按钮 个护家清**」——极容易误判成选择器坏了。
   现在这条判断已内置，不再需要人工先验。
-- 等满 `LOGIN_WAIT_SEC` 仍未登录 → 截图 `out/collect/need_login<tag>.png`
-  + `sys.exit(3)`（驱动层中止全流程）。
+- 等满 `LOGIN_WAIT_SEC` 仍未登录 → 截图 `out/collect/need_login<tag>_<i>.png`
+  与 `login_timeout<tag>_<i>.png`（**每个标签页一张**）+ `sys.exit(3)`（驱动层中止全流程）。
+- ⚠️ 不要在这里写 `except Exception: pass` 吞掉截图异常 —— 曾经因此**没有任何诊断线索**。
 - `login.py` **保留但降级为可选辅助**（想在另一个终端先扫码时用）：
   ```bash
   "$PY" login.py --check     # 只检查，输出「已登录 / 需要重新登录」

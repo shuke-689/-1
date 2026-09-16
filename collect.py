@@ -99,6 +99,9 @@ LOGIN_WAIT_SEC = int(os.environ.get("LOGIN_WAIT_SEC", "600"))
 LOGIN_POLL_SEC = float(os.environ.get("LOGIN_POLL_SEC", "5"))
 # 登录后达人广场才会出现的字样（与 login.py 保持一致）
 LOGGED_IN_MARK = ("主推类目", "找达人", "按商品找达人")
+# 官方登录页：实测在抖音电商 marketing 落地页上点「登录」**不出二维码**，
+# 所以未登录时直接把使用者送到这个地址（与 login.py 的兜底一致）
+LOGIN_URL = os.environ.get("LOGIN_URL", "https://buyin.jinritemai.com/login")
 
 # 【筛选】结算总额 —— 用户 2026-09-15 由「视频结算总额」改为「结算总额」
 # 字段名（实测自 /square_pc_api/square/filter）：
@@ -741,24 +744,50 @@ def main():
         # ---------- 登录态检查（用户 2026-09-16：跳过自动登录，等使用者自己登） ----------
         # 登录过期后 daren-square 会跳到抖音电商公开落地页（右上角「登录」），
         # 后续只会表现为「未找到类目按钮」——很容易误判成选择器坏了。
-        # 现在的策略：**不自动登录、不立刻中止**，在原地等使用者在已打开的 Edge
-        # 窗口里手动登录（会话持久化在 .edge-auto/profile），检测到就继续采集。
-        def _page_body():
-            for _t in range(5):
+        # 策略：**不自动登录、不立刻中止** —— 主动把**官方登录页**在浏览器里打开，
+        # 让使用者在那个 Edge 窗口里自己登录（会话持久化在 .edge-auto/profile），
+        # 本脚本轮询**所有标签页**，检测到登录就自动继续。
+
+        def _body_of(pg, tries=1):
+            for _t in range(tries):
                 try:
-                    b = page.evaluate(
+                    b = pg.evaluate(
                         "() => (document.body.innerText || '').slice(0, 4000)")
                     if b and b.strip():
                         return b
                 except Exception:
                     pass
-                time.sleep(2.5)     # 页面可能正在跳转（落地页 -> 登录页）
+                if tries > 1:
+                    time.sleep(2.5)     # 页面可能正在跳转（落地页 -> 登录页）
             return ""
 
+        def _scan_pages():
+            """遍历所有标签页找登录标记，返回 (命中的页面, 命中的标记)。"""
+            for pg in list(ctx.pages):
+                hit = [m for m in LOGGED_IN_MARK if m in _body_of(pg)]
+                if hit:
+                    return pg, hit
+            return None, []
+
+        def _shot_all(tag):
+            """把每个标签页都截一张（登录常发生在新标签页，只截主页面会漏证据）。"""
+            for i, pg in enumerate(list(ctx.pages)):
+                name = "%s%s_%d.png" % (tag, OUT_TAG, i)
+                fp = os.path.join(OUT, name)
+                try:
+                    pg.screenshot(path=fp)
+                    log("   （已截图 out/collect/%s）" % name)
+                except Exception as e:
+                    # 之前这里写的是 except: pass，导致出问题时**没有任何线索**
+                    log("   （截图 %s 失败：%s）" % (name, str(e)[:90]))
+
         def wait_manual_login():
-            """检测到未登录时原地等使用者手动登录。返回 (是否已登录, 诊断串)。"""
-            body = _page_body()
-            hit = [m for m in LOGGED_IN_MARK if m in body]
+            """检测到未登录时打开登录页并原地等使用者手动登录。
+
+            返回 (是否已登录, 诊断串)。
+            """
+            b = _body_of(page, tries=5)
+            hit = [m for m in LOGGED_IN_MARK if m in b]
             if hit:
                 return True, "已登录（命中 %s）" % "/".join(hit)
             if LOGIN_WAIT_SEC <= 0:
@@ -766,30 +795,35 @@ def main():
 
             log("!" * 66)
             log("!! 当前未登录精选联盟（达人广场被跳到了公开落地页）")
-            log("!! 按你的设置：**跳过自动登录环节** —— 请直接在**刚打开的 Edge 窗口**里")
-            log("!!   手动登录（扫码 / 账号密码都行）。会话会存进 .edge-auto/profile，")
-            log("!!   以后就不需要再登了。登录成功后本脚本会自动继续，无需其他操作。")
-            log("!! 这里最多等 %d 秒。" % LOGIN_WAIT_SEC)
+            log("!! 按你的设置：**跳过自动登录环节** —— 你自己在浏览器里登录即可；")
+            log("!!   本脚本只负责把登录页打开，然后停在这里等你。")
+            log("!! 最多等 %d 秒（约 %d 分钟）。" % (LOGIN_WAIT_SEC, LOGIN_WAIT_SEC // 60))
             log("!" * 66)
+            _shot_all("need_login")
+
+            # 主动把官方登录页开出来：对着 marketing 落地页使用者会找不到登录入口
             try:
-                page.screenshot(path=os.path.join(OUT, "need_login%s.png" % OUT_TAG))
-                log("   （已截图 out/collect/need_login%s.png 备查）" % OUT_TAG)
-            except Exception:
-                pass
+                lp = ctx.new_page()
+                lp.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
+                try:
+                    lp.bring_to_front()
+                except Exception:
+                    pass
+                log("   ✅ 已在浏览器里打开登录页：%s" % LOGIN_URL)
+                log("      请在**那个 Edge 窗口**里登录（扫码 / 账号密码都行），"
+                    "本脚本不用管。")
+            except Exception as e:
+                log("   ⚠️ 自动打开登录页失败：%s" % str(e)[:100])
+                log("      请在 Edge 地址栏手动输入：%s" % LOGIN_URL)
 
             t0 = time.time()
             n = 0
             while time.time() - t0 < LOGIN_WAIT_SEC:
                 time.sleep(LOGIN_POLL_SEC)
                 n += 1
-                try:
-                    body = page.evaluate(
-                        "() => (document.body.innerText || '').slice(0, 4000)") or ""
-                except Exception:
-                    body = ""
-                hit = [m for m in LOGGED_IN_MARK if m in body]
+                _hitpg, hit = _scan_pages()
                 if not hit:
-                    if n % 6 == 0:
+                    if n % 12 == 0:         # 约每分钟报一次
                         log("   …仍在等待手动登录（已等 %d/%d 秒）"
                             % (int(time.time() - t0), LOGIN_WAIT_SEC))
                     continue
@@ -799,21 +833,23 @@ def main():
                 try:
                     page.goto(DAREN, wait_until="domcontentloaded", timeout=90_000)
                     time.sleep(6)
-                    b2 = page.evaluate(
-                        "() => (document.body.innerText || '').slice(0, 4000)") or ""
+                    b2 = _body_of(page)
                     if any(m in b2 for m in LOGGED_IN_MARK):
                         log("   已回到达人广场，复核通过。")
                         return True, "已登录"
                     log("   ⚠️ 达人广场复核未通过，继续等待……")
                 except Exception as e:
-                    log("   复核时出错（忽略，继续等）：%s" % str(e)[:80])
+                    log("   复核时出错（忽略，继续等）：%s" % str(e)[:100])
                 t0 = time.time()        # 复核没过 -> 重新计时
+            _shot_all("login_timeout")
             return False, "等待 %d 秒仍未检测到登录" % LOGIN_WAIT_SEC
 
         login_ok, login_why = wait_manual_login()
         if not login_ok:
             log("!! %s" % login_why)
-            log("!! 可选：也可以先在另一个终端跑  python login.py  扫码，再重跑本脚本。")
+            log("!! 想给更长的登录时间就设大 LOGIN_WAIT_SEC，例如：")
+            log("!!   LOGIN_WAIT_SEC=7200 python collect_30.py")
+            log("!! 也可以先在另一个终端跑  python login.py  扫码，再重跑本脚本。")
             time.sleep(2)
             try:
                 ctx.close()
