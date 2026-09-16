@@ -21,6 +21,10 @@ __pycache__/
 # 本机个人工作记忆（规则知识已沉淀到 RUNBOOK.md，这里不共享）
 .workbuddy/memory/
 
+# 技能打包产物（dist/ 下，用 package_skill.py 重新生成）
+dist/
+*.zip
+
 # 编辑器 / 系统
 .vscode/
 .idea/
