@@ -1,0 +1,250 @@
+# -*- coding: utf-8 -*-
+"""一键同步：把本地的优化推上去、把好友的优化拉下来。
+
+    python sync.py status              # 看有哪些未提交改动
+    python sync.py pull                # 拉取最新优化（含好友提交的）
+    python sync.py push -m "新增XX规则"  # 提交并推送本地优化
+    python sync.py auto -m "说明"       # 先拉后推（日常最常用）
+    python sync.py remote <仓库地址>     # 首次绑定云端仓库
+    python sync.py log                 # 看最近提交
+
+设计要点：
+  * 自动探测 git（WorkBuddy 自带 PortableGit，不要求系统装 git）
+  * 推送前会拦截被误加的敏感文件（.edge-auto / out / .probe/libs）
+  * 拉取后发现 requirements.txt 有变化 -> 提醒重跑 setup_env.py
+"""
+import os
+import subprocess
+import sys
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+
+# 绝不允许进入版本库的路径前缀
+FORBIDDEN = (".edge-auto/", ".edge-work/", ".probe/libs/", "out/",
+             ".workbuddy/memory/")
+
+
+def find_git():
+    cands = []
+    home = os.path.expanduser("~")
+    pg = os.path.join(home, ".workbuddy", "binaries", "PortableGit", "versions")
+    if os.path.isdir(pg):
+        for v in sorted(os.listdir(pg)):
+            for sub in ("cmd", "bin"):
+                p = os.path.join(pg, v, sub, "git.exe")
+                if os.path.exists(p):
+                    cands.append(p)
+    for p in (r"C:\Program Files\Git\cmd\git.exe",
+              r"C:\Program Files (x86)\Git\cmd\git.exe",
+              "/usr/bin/git", "/usr/local/bin/git"):
+        if os.path.exists(p):
+            cands.append(p)
+    # 排一下版本号，取最新的 PortableGit
+    cands.sort(reverse=True)
+    for c in cands:
+        return c
+    return "git"
+
+
+GIT = find_git()
+
+
+def hr(t=""):
+    print("=" * 62)
+    if t:
+        print(t)
+        print("=" * 62)
+
+
+def run(args, capture=True, check=False):
+    """跑一条 git 命令。返回 (退出码, 输出文本)。"""
+    cmd = [GIT] + args
+    try:
+        p = subprocess.run(cmd, cwd=BASE, capture_output=capture,
+                           text=True, encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        hr("❌ 找不到 git")
+        print("git 路径： %s" % GIT)
+        print("请确认 WorkBuddy 自带的 PortableGit 存在，或自行安装 Git 后重试。")
+        sys.exit(1)
+    out = (p.stdout or "") + (p.stderr or "")
+    if check and p.returncode != 0:
+        print(out.strip())
+        sys.exit(p.returncode)
+    return p.returncode, out.strip()
+
+
+def have_repo():
+    rc, _ = run(["rev-parse", "--is-inside-work-tree"])
+    return rc == 0
+
+
+def have_remote():
+    rc, out = run(["remote"])
+    return rc == 0 and bool(out.strip())
+
+
+def ensure_repo():
+    if not have_repo():
+        hr("📦 首次使用：初始化本地仓库")
+        run(["init", "-b", "main"], check=True)
+        run(["config", "core.autocrlf", "false"])
+        print("已初始化。接着绑定云端仓库：  python sync.py remote <地址>")
+
+
+def show_forbidden():
+    """检查暂存区里有没有不该提交的东西。"""
+    rc, out = run(["diff", "--cached", "--name-only"])
+    if rc != 0 or not out:
+        return []
+    bad = [f for f in out.splitlines()
+           if f.replace("\\", "/").lstrip("./").startswith(FORBIDDEN)]
+    return bad
+
+
+def cmd_status():
+    ensure_repo()
+    hr("🔍 同步状态")
+    rc, out = run(["status", "-sb"])
+    print(out or "(干净)")
+    rc, rem = run(["remote", "-v"])
+    print()
+    print("远端：" + (rem.splitlines()[0] if rem.strip() else "❌ 未配置 -> python sync.py remote <地址>"))
+    bad = show_forbidden()
+    if bad:
+        print()
+        print("⚠️ 暂存区包含敏感/大文件，请先取消暂存：")
+        for b in bad:
+            print("     git reset -- %s" % b)
+
+
+def cmd_pull():
+    ensure_repo()
+    if not have_remote():
+        print("❌ 还没配置远端。先跑：  python sync.py remote <仓库地址>")
+        return 1
+    before = read_req()
+    hr("⬇️  拉取云端最新优化")
+    rc, out = run(["pull", "--rebase", "--autostash"])
+    print(out or "(无输出)")
+    if rc != 0:
+        print()
+        print("⚠️ 拉取冲突了（你和好友改了同一处）。按下面处理：")
+        print("   1) git status                 # 看哪些文件冲突")
+        print("   2) 打开冲突文件，改掉 <<<<<<< ======= >>>>>>> 标记")
+        print("   3) git add <文件> && git rebase --continue")
+        print("   4) 再跑  python sync.py push -m \"合并冲突\"")
+        return rc
+    after = read_req()
+    if before and after and before != after:
+        print()
+        print("📦 requirements.txt 有变动 -> 建议重跑：  \"$PY\" setup_env.py")
+    return 0
+
+
+def read_req():
+    p = os.path.join(BASE, "requirements.txt")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def cmd_push(msg=None):
+    ensure_repo()
+    if not have_remote():
+        print("❌ 还没配置远端。先跑：  python sync.py remote <仓库地址>")
+        return 1
+    bad = show_forbidden()
+    if bad:
+        hr("⛔ 拒绝提交：暂存区含敏感文件")
+        for b in bad:
+            print("   %s" % b)
+        print()
+        print("这些文件含登录态 / 达人微信号 / 大体积依赖，绝不能上传。")
+        print("请先：  git reset")
+        return 1
+
+    rc, out = run(["status", "--porcelain"])
+    if out.strip():
+        hr("📝 提交本地优化")
+        run(["add", "-A"], check=True)
+        if not msg:
+            msg = "sync: %s" % __import__("time").strftime("%Y-%m-%d %H:%M")
+        rc, out = run(["commit", "-m", msg])
+        print(out or "(无输出)")
+    else:
+        print("本地没有新改动。")
+
+    hr("⬆️  推送到云端")
+    rc, out = run(["push"])
+    print(out or "(无输出)")
+    if rc != 0:
+        print()
+        print("⚠️ 推送失败，常见原因：")
+        print("   * 云端有新提交 -> 先跑  python sync.py pull  再 push")
+        print("   * 没登录 -> 首次推送会要求输入账号/令牌")
+    return rc
+
+
+def cmd_auto(msg=None):
+    rc = cmd_pull()
+    if rc != 0:
+        return rc
+    print()
+    return cmd_push(msg)
+
+
+def cmd_remote(url):
+    ensure_repo()
+    rc, out = run(["remote"])
+    if out.strip():
+        run(["remote", "set-url", "origin", url], check=True)
+        print("已更新 origin -> %s" % url)
+    else:
+        run(["remote", "add", "origin", url], check=True)
+        print("已绑定 origin -> %s" % url)
+    rc, out = run(["branch", "--show-current"])
+    print("当前分支： %s" % (out.strip() or "main"))
+    print()
+    print("首次推送：  python sync.py push -m \"首次共享\"")
+
+
+def cmd_log():
+    ensure_repo()
+    rc, out = run(["log", "--oneline", "-n", "15"])
+    print(out or "(还没有提交)")
+
+
+def main():
+    a = sys.argv[1:]
+    cmd = a[0] if a else "auto"
+    msg = None
+    if "-m" in a:
+        i = a.index("-m")
+        if i + 1 < len(a):
+            msg = a[i + 1]
+
+    if cmd == "status":
+        cmd_status()
+    elif cmd == "pull":
+        sys.exit(cmd_pull())
+    elif cmd == "push":
+        sys.exit(cmd_push(msg))
+    elif cmd == "auto":
+        sys.exit(cmd_auto(msg))
+    elif cmd == "remote":
+        if "--url" not in a and len(a) < 2:
+            print(__doc__)
+            sys.exit(1)
+        url = a[-1]
+        cmd_remote(url)
+    elif cmd == "log":
+        cmd_log()
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

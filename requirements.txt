@@ -1,0 +1,21 @@
+# 抖音精选联盟 → 微信加达人  依赖清单
+# 全部装进项目内的 .probe/libs（不污染全局 Python）
+# 一键安装：  python setup_env.py
+#
+# 说明：本项目用 WorkBuddy 自带的托管 Python 3.13 运行。
+# 若你的 Python 版本不同（3.11~3.13 均可），装不上时去掉 == 版本锁再试。
+
+# —— 浏览器自动化（阶段A 采集）——
+playwright==1.62.0
+
+# —— Excel 输出（7 列登记表）——
+openpyxl==3.1.5
+
+# —— OCR（阶段B 微信自绘界面识别）——
+rapidocr_onnxruntime==1.2.3
+pillow==12.3.0
+numpy==2.5.3
+
+# —— Windows 窗口/控件（阶段B 辅助探针）——
+comtypes==1.4.16
+uiautomation==2.0.29
