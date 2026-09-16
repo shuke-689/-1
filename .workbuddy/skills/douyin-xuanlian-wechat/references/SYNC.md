@@ -40,10 +40,15 @@
 
 ## 2. 选哪个云端平台
 
+> **本项目当前使用：GitHub · 私有仓库**
+> <https://github.com/shuke-689/-1>
+> 克隆：`git clone https://github.com/shuke-689/-1.git`
+> 换平台时按上表另选，用 `python sync.py remote <新地址>` 切换即可。
+
 | 平台 | 适合 | 注意 |
 |---|---|---|
 | **CNB**（cnb.cool，腾讯） | 国内网络快，体验最顺 | 需注册；可在 WorkBuddy 里装 CNB 连接器后由 AI 代管仓库/PR |
-| **GitHub** | 通用、生态全 | 国内访问可能慢；私有仓库免费 |
+| **GitHub**（**当前在用**） | 通用、生态全 | 国内访问可能慢；私有仓库免费 |
 | **Gitee** | 国内快 | 需实名 |
 | 企业微信微盘 / 微云 | 只想"发一份给对方" | **没有版本合并**，做不到双向同步，仅适合首次分发 |
 
@@ -54,19 +59,27 @@
 
 ---
 
-## 3. 首次配置（仓库主人 / 你）
+## 3. 首次配置（仓库主人 / 你）—— ✅ 已完成
+
+> 2026-09-16 已完成，仓库为 <https://github.com/shuke-689/-1>（私有）。
+> 以下是记录，供换机器/换平台时重做。
 
 ```bash
 cd <项目根>
 source tools/env.sh
 
 "$PY" sync.py status                 # 会自动 git init（分支 main）
-"$PY" sync.py remote <仓库地址>       # 例：https://cnb.cool/<你>/douyin-daren.git
+"$PY" sync.py remote <仓库地址>       # 例：https://github.com/<你>/<仓库>.git
 "$PY" sync.py push -m "首次共享：采集+加好友全链路"
 ```
 
-推送时若要求登录，按平台提示输入**账号 + 访问令牌（PAT）**。
-建议用 PAT 而不是密码（GitHub 已不支持密码推送）。
+**GitHub 首次推送的授权**：本机 git 已配置 `credential.helper manager`
+（WorkBuddy 自带的 Git Credential Manager 2.9）。第一次 `push` 会弹浏览器窗口，
+点一次「Authorize」即可，之后凭据自动缓存，不用再授权。
+
+```bash
+git config --global credential.helper manager   # 已设好，换机器时补这一条
+```
 
 **推送前自查**（`sync.py` 也会拦）：
 
@@ -81,8 +94,10 @@ du -sh .git                              # 不该出现几百 MB
 
 ```bash
 # 1) 装好 WorkBuddy 桌面端，克隆仓库到一个本地目录
-#    （WorkBuddy 里直接说「把 <仓库地址> 克隆到 <路径>」即可，或手动 git clone）
-cd <克隆下来的目录>
+git clone https://github.com/shuke-689/-1.git
+#    （需先被加为该私有仓库的协作者；或直接对 WorkBuddy 说
+#      「把 https://github.com/shuke-689/-1 克隆到 <路径>」）
+cd -1
 
 # 2) 装依赖
 source tools/env.sh
@@ -97,6 +112,10 @@ source tools/env.sh
 
 # 5) 准备微信端：登录微信桌面端，打开「+」→「添加朋友」窗口
 ```
+
+> 好友首次 `push` 同样会弹一次 GitHub 浏览器授权。
+> 若克隆私有仓库失败，是还没被加成协作者——
+> 在 GitHub 仓库页 `Settings → Collaborators` 里邀请对方的 GitHub 账号。
 
 之后照 `SKILL.md` 的触发词操作即可（「开始筛选达人」/「开始帮我添加微信」）。
 

@@ -108,12 +108,14 @@ source tools/env.sh        # 自动探测 Python / PYTHONPATH / git，跨机器�
 设计：**整个项目 = 一个 git 仓库**，本技能就在仓库内，
 所以规则、脚本、文档、乃至技能本身的优化都会随 git 一起同步。
 
+**云端仓库（GitHub 私有）**：<https://github.com/shuke-689/-1>
+
 ```bash
 "$PY" sync.py status             # 看本地有哪些未提交改动
 "$PY" sync.py auto -m "说明"      # 日常：先拉后推
 "$PY" sync.py pull               # 只拉好友的优化
 "$PY" sync.py push -m "说明"      # 只推自己的优化
-"$PY" sync.py remote <仓库地址>    # 首次绑定云端仓库
+"$PY" sync.py remote <仓库地址>    # 首次绑定 / 切换云端仓库
 ```
 
 **约定**

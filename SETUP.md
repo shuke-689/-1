@@ -85,13 +85,16 @@ source tools/env.sh
 整个项目就是一个 git 仓库，**技能和规则文档都在仓库里**，
 所以任何一方改了规则、脚本或文档，另一方 `pull` 一下就同步了。
 
+**云端仓库**：<https://github.com/shuke-689/-1>（私有）
+克隆：`git clone https://github.com/shuke-689/-1.git`
+
 ```bash
 "$PY" sync.py pull                # 拉取对方的优化
 "$PY" sync.py auto -m "说明改动"    # 提交并推送自己的优化
 "$PY" sync.py status              # 看当前状态
 ```
 
-首次绑定云端仓库：`"$PY" sync.py remote <仓库地址>`
+首次绑定云端仓库：`"$PY" sync.py remote https://github.com/shuke-689/-1.git`
 
 > 详细流程、平台选择、冲突处理：见
 > `.workbuddy/skills/douyin-xuanlian-wechat/references/SYNC.md`
