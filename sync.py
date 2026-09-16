@@ -151,16 +151,30 @@ def write_remote_ref(branch, sha, verbose=True, why=""):
     return True
 
 
-def heal_remote_ref(branch=None, verbose=True):
+def heal_remote_ref(branch=None, verbose=True, only_if_missing=False):
     """按 **FETCH_HEAD** 补齐远端跟踪引用（用于 fetch/pull 之后）。
 
     本机 git 写 `refs/remotes/**` 静默失败的后果是 `git status` 显示
     `origin/main [gone]`、`git rebase origin/main` 找不到上游。
-    注意：只适用于 fetch 之后。**push 之后不要用它** —— 那时 FETCH_HEAD
-    还是推送前的旧值，会把引用改回去（应用 head_sha + write_remote_ref）。
+
+    重要：FETCH_HEAD 只反映**上一次 fetch**时的远端状态。push 之后它还是
+    推送前的旧值，此时按它自愈会把引用**改回去**。所以：
+      * fetch/pull 之后  -> 可以正常用（only_if_missing=False）
+      * push 之后        -> 不要用，改用 head_sha() + write_remote_ref()
+      * 只想查状态的场景 -> only_if_missing=True（仅在引用缺失/为空时补）
     """
     branch = branch or current_branch()
     gd = _git_dir()
+    if only_if_missing:
+        tgt = os.path.join(gd, "refs", "remotes", "origin", branch)
+        cur = ""
+        if os.path.exists(tgt):
+            try:
+                cur = open(tgt, encoding="utf-8").read().strip()
+            except Exception:
+                cur = ""
+        if cur:
+            return False  # 已有值，不动它（可能是刚 push 后的正确值）
     fh = os.path.join(gd, "FETCH_HEAD")
     if not os.path.exists(fh):
         return False
@@ -233,7 +247,9 @@ def commit_local(msg=None, quiet=False):
 
 def cmd_status():
     ensure_repo()
-    heal_remote_ref(verbose=False)
+    # 仅在引用文件缺失时补（有值就不动：那可能是刚 push 后的正确值，
+    # 而 FETCH_HEAD 仍是旧的，会把它改回去）
+    heal_remote_ref(verbose=False, only_if_missing=True)
     hr("🔍 同步状态")
     rc, out = run(["status", "-sb"])
     print(out or "(干净)")
