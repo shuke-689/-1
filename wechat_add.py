@@ -113,8 +113,23 @@ class WeChat:
 
     # ---------- 截图 / OCR / 点击 ----------
     def shot(self, name=None):
-        self.rect = w.window_rect(self.win)
+        # 2026-09-16 踩到：`cannot write empty image` —— 窗口 rect 取成 0x0
+        # （窗口被最小化 / 句柄失效 / 被别的窗口挤掉），截图就是空图，保存时炸。
+        # 这里先校验 rect，必要时把窗口重新提到前台并重试，再不行就明确报错。
+        for attempt in range(4):
+            self.rect = w.window_rect(self.win)
+            if self.rect[2] > 10 and self.rect[3] > 10:
+                break
+            if attempt == 0:
+                self.refresh()              # 句柄可能变了
+            if attempt <= 1:
+                w.set_foreground(self.win)  # 可能被最大化窗口挤到后面
+            time.sleep(0.9)
         img = w.screenshot_region(*self.rect)
+        if getattr(img, "width", 0) <= 0 or getattr(img, "height", 0) <= 0:
+            raise RuntimeError(
+                "微信窗口截图失败（rect=%s）——窗口可能被最小化或被其他窗口完全遮挡"
+                % (self.rect,))
         if name:
             img.save(os.path.join(STEPS, "%s.png" % name))
         return img
