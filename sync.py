@@ -110,33 +110,24 @@ def _git_dir():
 
 # ---------------------------------------------------------------- 环境适配
 
-def heal_remote_ref(branch=None, verbose=True):
-    """本机 git 写 `refs/remotes/**` 会**静默失败**：
-    `git update-ref refs/remotes/origin/main <sha>` 返回 0，但文件不落盘
-    （`refs/heads/*` 一切正常）。后果是 `git status` 显示
-    `origin/main [gone]`、`git rebase origin/main` 找不到上游。
+def head_sha(branch=None):
+    """取本地分支当前指向的提交号。"""
+    branch = branch or current_branch()
+    rc, out = run(["rev-parse", branch])
+    return out.strip() if rc == 0 else ""
 
-    实测结论：**直接写 ref 文件是好的**，所以这里按 FETCH_HEAD 把引用补上。
+
+def write_remote_ref(branch, sha, verbose=True, why=""):
+    """直接把 `refs/remotes/origin/<branch>` **文件**写成 <sha>。
+
+    为什么不用 `git update-ref`：本机 git 写 `refs/remotes/**` 会**静默失败**
+    （`git update-ref refs/remotes/origin/main <sha>` 返回 0，但文件不落盘；
+    `refs/heads/*` 一切正常）。实测**直接写文件是好的**，故走这条路径。
     返回 True 表示本次做了修正。
     """
-    branch = branch or current_branch()
-    gd = _git_dir()
-    fh = os.path.join(gd, "FETCH_HEAD")
-    if not os.path.exists(fh):
-        return False
-    sha = ""
-    try:
-        with open(fh, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                # 形如：<sha>\t\tbranch 'main' of https://github.com/...
-                if "branch '%s'" % branch in line:
-                    sha = line.split("\t", 1)[0].strip()
-                    break
-    except Exception:
-        return False
     if not sha:
         return False
-
+    gd = _git_dir()
     tgt = os.path.join(gd, "refs", "remotes", "origin", branch)
     cur = ""
     if os.path.exists(tgt):
@@ -155,9 +146,36 @@ def heal_remote_ref(branch=None, verbose=True):
             print("  [环境适配] 修正远端跟踪引用失败：%s" % e)
         return False
     if verbose:
-        print("  [环境适配] 已补齐远端跟踪引用 origin/%s -> %s"
-              "（本机 git 写该路径静默失败）" % (branch, sha[:8]))
+        print("  [环境适配] 已补齐远端跟踪引用 origin/%s -> %s%s"
+              % (branch, sha[:8], why))
     return True
+
+
+def heal_remote_ref(branch=None, verbose=True):
+    """按 **FETCH_HEAD** 补齐远端跟踪引用（用于 fetch/pull 之后）。
+
+    本机 git 写 `refs/remotes/**` 静默失败的后果是 `git status` 显示
+    `origin/main [gone]`、`git rebase origin/main` 找不到上游。
+    注意：只适用于 fetch 之后。**push 之后不要用它** —— 那时 FETCH_HEAD
+    还是推送前的旧值，会把引用改回去（应用 head_sha + write_remote_ref）。
+    """
+    branch = branch or current_branch()
+    gd = _git_dir()
+    fh = os.path.join(gd, "FETCH_HEAD")
+    if not os.path.exists(fh):
+        return False
+    sha = ""
+    try:
+        with open(fh, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # 形如：<sha>\t\tbranch 'main' of https://github.com/...
+                if "branch '%s'" % branch in line:
+                    sha = line.split("\t", 1)[0].strip()
+                    break
+    except Exception:
+        return False
+    return write_remote_ref(branch, sha, verbose=verbose,
+                            why="（本机 git 写该路径静默失败）")
 
 
 # ---------------------------------------------------------------- 仓库/提交
@@ -286,8 +304,10 @@ def _push_only():
     rc, out = run(["push"])
     print(out or "(无输出)")
     if rc == 0:
-        # push 后 git 会更新远端跟踪引用，本机该写入同样静默失败 -> 手工补齐
-        heal_remote_ref(verbose=False)
+        # push 成功后远端已 == 本地 HEAD。本机 git 更新远端跟踪引用同样静默失败，
+        # 这里按**本地 HEAD** 补齐（不能用 heal_remote_ref：那读的是推送前的 FETCH_HEAD）
+        write_remote_ref(current_branch(), head_sha(), verbose=True,
+                         why="（push 后按本地 HEAD 补齐，本机 git 写该路径静默失败）")
     else:
         print()
         print("⚠️ 推送失败，常见原因：")
