@@ -135,6 +135,7 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 ```bash
 "$PY" wechat_add.py status              # 先看台账与剩余待加
 "$PY" wechat_add.py run --limit 10      # 正式跑，一轮最多 10 个
+"$PY" wechat_add.py csv                 # 需要时手工重导 add_results.csv
 ```
 
 启动后**立即提醒用户：8-10 分钟内不要碰鼠标键盘**（脚本持续抢占前台并注入键鼠）。
@@ -144,10 +145,17 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 - 一轮最多 **10-12 个**；两轮间隔 **≥2 小时**；触发风控后当日不再重试。
 - 看到「操作过于频繁，请稍后再试。」= 风控 → 脚本已内置自动停止 + 关弹窗。
 - **绝不采取任何绕过风控的手段。**
-- 实测：单轮 10 个安全；**连续累计约 24 次请求后必触发** → 不要连跑。
+- 实测：单轮 10 个安全。**「累计约 24 次必触发」这个阈值不准**——2026-09-16 一天
+  连跑 3 轮共 **30 次请求**（16:45 / 17:20 / 17:50，轮间隔仅 26-31 分钟）**未触发**；
+  但历史上确实中过一次 `risk_control`（台账里那条 `@鲁济公…`）。
+  → 阈值不是硬线，**别据此放宽节奏**，仍按「≤10 个/轮 + 轮间 ≥2 小时」执行；
+  想连跑时先把当天已发请求数报给用户，由用户决定。
 
 `wechat_add.py` 自带**多轮台账**（`out/wechat/add_results.json`），
 `run` 会跳过已完成达人、从断点继续，不会重复处理。
+每轮结束会**顺带刷新** `out/wechat/add_results.csv`（给人看的版本）；
+⚠️ 历史坑：csv 曾经长期停在旧日期（重构后只写 json 没人管 csv），
+别拿旧 csv 当名单 —— 要最新就 `wechat_add.py csv` 重导。
 
 **台账状态**（字段名是 `add_status`）：`sent` / `already` / `excluded` / `not_found` /
 `risk_control` / `error`。`DONE_STATUS = ("sent","already","excluded","not_found")`

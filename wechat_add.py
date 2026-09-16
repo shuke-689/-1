@@ -20,10 +20,13 @@
   python wechat_add.py probe-search <微信号>    # 搜一个号并 dump 结果页 OCR
   python wechat_add.py status                   # 看台账与剩余待加数量
   python wechat_add.py run --limit N [--dry]    # 正式跑；--dry 只填不发送（点取消）
+  python wechat_add.py csv                      # 把台账重新导出成 add_results.csv
 
-多轮台账：结果累积写入 out/wechat/add_results.json（不覆盖）。
+多轮台账：结果累积写入 out/wechat/add_results.json（不覆盖），
+并在每轮结束时同步刷新 out/wechat/add_results.csv（给人看的版本）。
 已 sent / already / excluded / not_found 的达人下一轮自动跳过，不会重复处理。
 """
+import csv
 import io
 import json
 import os
@@ -56,6 +59,18 @@ RISK_KW = ("操作过于频繁", "请稍后再试", "稍后再试", "操作频�
 # 不计入：unknown(结果页无法识别)、error、risk_control -> 下次会重试
 DONE_STATUS = ("sent", "already", "excluded", "not_found")
 RESULT_FILE = os.path.join(OUT, "add_results.json")
+CSV_FILE = os.path.join(OUT, "add_results.csv")
+# 台账状态 -> 给人看的中文标签（csv 用）
+STATUS_LABEL = {
+    "sent": "已发送",
+    "already": "已是好友",
+    "excluded": "命中排除词(跳过)",
+    "not_found": "搜不到(跳过)",
+    "risk_control": "风控(停手)",
+    "error": "出错(下轮重试)",
+    "unknown": "无法识别(下轮重试)",
+}
+CSV_HEADER = ["状态", "达人名(备注)", "抖音达人", "联系方式", "类型", "地区", "粉丝"]
 
 
 def log(m):
@@ -77,6 +92,30 @@ def load_ledger():
         if u:
             led[u] = r
     return led
+
+
+def export_csv(records=None):
+    """把台账导出成给人看的 csv（utf-8-sig，Excel 双击打开不乱码）。
+
+    历史坑：09-15 那份 add_results.csv 是旧版本一次性生成的，
+    后来重构只写 json -> csv 悄悄过期（09-16 时它还停在 09-15 的数据），
+    协作者会读到旧名单。现在 run() 里一并刷新，别让 csv 再变成陷阱。
+    """
+    if records is None:
+        records = list(load_ledger().values())
+    with open(CSV_FILE, "w", encoding="utf-8-sig", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(CSV_HEADER)
+        for r in records:
+            st = r.get("add_status") or "?"
+            note = r.get("add_note") or ""
+            # not_found/error 的 add_note 是报错文案，不是昵称 -> 不填「达人名(备注)」
+            shown = note if st in ("sent", "already", "excluded") else ""
+            wr.writerow([STATUS_LABEL.get(st, st), shown,
+                         r.get("nickname") or "", r.get("contact") or "",
+                         r.get("contact_type") or "", r.get("city") or "",
+                         r.get("fans") or ""])
+    return CSV_FILE
 
 
 class WeChat:
@@ -475,6 +514,7 @@ def run(limit=0, dry=False):
     json.dump(list(merged.values()),
               open(os.path.join(OUT, "add_results.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=2)
+    export_csv(list(merged.values()))
     if stop_reason:
         log("停止原因：%s" % stop_reason)
     from collections import Counter
@@ -513,5 +553,7 @@ if __name__ == "__main__":
         run(lim, dry="--dry" in args)
     elif mode == "status":
         status()
+    elif mode == "csv":
+        log("已导出 %s（%d 条）" % (export_csv(), len(load_ledger())))
     else:
         print(__doc__)
