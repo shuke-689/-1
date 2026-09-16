@@ -39,29 +39,42 @@ source tools/env.sh        # 自动探测 Python / PYTHONPATH / git，跨机器�
 
 ## 2. 阶段A：筛选采集
 
+**登录策略（用户 2026-09-16 定：跳过自动登录）**
+
+**不要**主动去跑 `login.py`。直接启动采集即可 —— 采集器自己会判断登录态：
+- 已登录 → 直接开筛；
+- 未登录 → **不中止**，在日志里打印提示，然后**停在原地等你手动登录**
+  （会话存进 `.edge-auto/profile`，之后长期有效），检测到就自动继续。
+
+所以要做的只有一件事：**采集启动后，如果日志出现「当前未登录精选联盟」，
+就在它已经打开的那个 Edge 窗口里自己登录一下**（扫码 / 账号密码都行）。
+
+等待上限由 `LOGIN_WAIT_SEC` 控制（默认 600 秒，可按需调大）：
+```bash
+export LOGIN_WAIT_SEC=1800    # 给足扫码时间
+```
+`login.py` 仍保留，但只是**可选辅助**（想在另一个终端先扫码时用），
+不再是流程前置条件：`"$PY" login.py --check` / `"$PY" login.py`。
+
+⚠️ 为什么以前要单独查登录态：登录过期时 `daren-square` 会跳到抖音电商公开落地页，
+采集器只表现为「未找到类目按钮」，**极易误判成选择器坏了**。现在这条判断已内置。
+
 **标准流程**
 
-1. **先查登录态**（必做，否则会误判成选择器坏了）：
-   ```bash
-   "$PY" login.py --check
-   ```
-   报「需要重新登录」→ 先 `"$PY" login.py` 让用户用抖音 App 扫码。
-   ⚠️ 登录过期时 `daren-square` 会跳到抖音电商公开落地页，
-   采集器只表现为「未找到类目按钮」，**极易误判**。
-
-2. **后台启动双类目采集**（15 个护家清 + 15 美妆，按 uid 去重合并）：
+1. **后台启动双类目采集**（15 个护家清 + 15 美妆，按 uid 去重合并）：
    ```bash
    export MAX_SCROLL=60 MAX_CANDIDATE=300
-   export BATCH_COOLDOWN=300 MAX_RETRY=3
+   export BATCH_COOLDOWN=300 MAX_RETRY=3 LOGIN_WAIT_SEC=1800
    "$PY" collect_30.py
    ```
    必须放进**一个** `run_in_background` 任务里跑——Bash 命令结束时其子进程会被回收。
    两批之间**强制冷却 5 分钟**，避免平台限流 11001。
 
-3. **盯进度**：`out/collect_30.log`、`out/collect_ghq.log`、`out/collect_mz.log`。
+2. **盯进度**：`out/collect_30.log`、`out/collect_ghq.log`、`out/collect_mz.log`。
    每批取满 15 个有效达人（成功取到联系方式）自动停。
+   看到「当前未登录精选联盟」→ **提醒用户去 Edge 窗口里登录**。
 
-4. **产出**：`out/collect/darens.xlsx`（7 列登记表）+ `darens.json` / `darens.csv`。
+3. **产出**：`out/collect/darens.xlsx`（7 列登记表）+ `darens.json` / `darens.csv`。
 
 **退出码约定**（驱动层据此决策）
 
@@ -69,7 +82,7 @@ source tools/env.sh        # 自动探测 Python / PYTHONPATH / git，跨机器�
 |---|---|---|
 | 0 | 正常 | 读 `darens_<tag>.json` |
 | 2 | 类目按钮没点到 | 冷却 `CATE_RETRY_WAIT`（45s）重试 |
-| 3 | 登录态失效 | **中止全流程**，提示跑 `login.py` |
+| 3 | 等满 `LOGIN_WAIT_SEC` 仍没登录 | **中止全流程**；调大 `LOGIN_WAIT_SEC` 或先跑可选辅助 `login.py` |
 
 **筛选条件与业务规则**：全部见 `RUNBOOK.md` 第 2 节（含 7 条规则、接口字段对照、
 结算类字段表、内容类型 40 项、昵称排除三层词表）。
@@ -135,7 +148,10 @@ source tools/env.sh        # 自动探测 Python / PYTHONPATH / git，跨机器�
 - `.probe/libs/` —— 370MB 平台相关二进制
 - `.workbuddy/memory/` —— 本机个人工作记忆
 
-好友 clone 后必须跑 `"$PY" login.py` 扫**自己的**码。
+好友 clone 后**首次跑采集时，在采集器打开的 Edge 窗口里登录自己的精选联盟账号**即可
+（会话存进各自的 `.edge-auto/profile`，不会共享）。可选辅助脚本：`"$PY" login.py`。
+
+⚠️ 登录态在 `.edge-auto/`，**不随 git 分享** —— 好友必须用自己的账号，别想抄你的 cookie。
 
 ## 5. 安全铁律（不可违反）
 
@@ -150,7 +166,8 @@ source tools/env.sh        # 自动探测 Python / PYTHONPATH / git，跨机器�
 
 | 症状 | 真因 / 动作 |
 |---|---|
-| 「未找到类目按钮」 | ①登录态失效（跑 `login.py --check`）②页面布局变化 |
+| 日志出现「当前未登录精选联盟」 | **正常等待态**，不是报错 → 让用户去 Edge 窗口里手动登录；等满 `LOGIN_WAIT_SEC` 会退出码 3 |
+| 「未找到类目按钮」 | ①页面布局变化 ②极少数情况下登录态判定漏判 → 看 `out/collect/need_login*.png` |
 | 「未找到相关达人，请调整筛选后重试」 | **平台限流**，看返回 `code:11001`；冷却后重试，别改筛选逻辑 |
 | 每个达人主页都报 `Execution context was destroyed` | 浏览器假死（常见于系统休眠后）→ 脚本会自动 `restart_browser()`；**但重启不恢复登录** |
 | 列表只滚出几条就没新增 | 滚动容器选错 / 懒加载 → 见 RUNBOOK「列表翻页」 |

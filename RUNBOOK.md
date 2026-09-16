@@ -42,28 +42,42 @@ PY="/c/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.ex
 **入口页面**：`https://buyin.jinritemai.com/dashboard/merchant/home`（商家版精选联盟）
 → 找达人：`https://buyin.jinritemai.com/dashboard/servicehall/daren-square`
 
-**登录**：独立 Edge 配置 `.edge-auto/`，首次需用户扫码一次，之后登录态持久化。
+**登录**：独立 Edge 配置 `.edge-auto/`，登录态持久化，**不随 git 分享**。
 
-**⚠️ 登录态检查 / 重新登录（2026-09-15 踩到）**
+**⚠️ 登录策略 —— 跳过自动登录（用户 2026-09-16 定）**
+
+**不再把 `login.py` 作为流程前置。** 采集器自己判断登录态：
+- 已登录 → 直接开筛；
+- 未登录 → **不中止**，日志打印「当前未登录精选联盟」，然后**停在原地等使用者
+  自己在它已经打开的 Edge 窗口里登录**，检测到就自动继续（登录常在新标签页完成，
+  命中后会 `goto` 回 `daren-square` 复核一次再往下走）。
+
 ```bash
-"$PY" login.py --check     # 只检查，输出「已登录 / 需要重新登录」
-"$PY" login.py             # 打开浏览器调出二维码，等用户扫码（默认最长 900 秒）
+export LOGIN_WAIT_SEC=1800      # 等待上限（秒），默认 600；设 0 = 不等待，直接退出码 3
+export LOGIN_POLL_SEC=5         # 轮询间隔（秒）
 ```
+
+- 判定依据：登录后页面正文必含「主推类目」「找达人」「按商品找达人」。
 - 登录过期后 `daren-square` 会跳到**抖音电商公开落地页**（右上角「登录」），
   采集器只表现为「**未找到类目按钮 个护家清**」——极容易误判成选择器坏了。
-- 现在 `collect.py` 有**登录预检**：打开页面后若正文没有「主推类目/找达人」，
-  直接截图 + `sys.exit(3)`，并打印修复命令，不再白跑。
-- 判定依据：登录后页面正文必含「主推类目」「找达人」「按商品找达人」。
-- `WAIT_SEC` 可调等待秒数（默认 900）；`POLL_SEC` 轮询间隔（默认 5）。
-- **`login.py` 两条加固（00:57 实测补上）**：
-  1. 登录态判定**遍历所有标签页**（登录常在新标签页完成），命中后自动回
-     `daren-square` 复核；
-  2. 若当前页没出二维码（既无「扫码」字样也无 ≥120px 大图）→ **兜底新开标签页
-     直开 `https://buyin.jinritemai.com/login`**。
-     ⚠️ 实测在抖音电商 marketing 落地页上**点「登录」是不出二维码的**，所以必须有这条兜底。
-- 二维码/超时都落多张截图 `login_qr_*.png` / `login_timeout_*.png`。
-- ⚠️ `login.py` 等待期间**不会反复刷新页面**（否则会把二维码刷掉）；
-  在浏览器里**干净关闭**才能把 cookie 落盘。
+  现在这条判断已内置，不再需要人工先验。
+- 等满 `LOGIN_WAIT_SEC` 仍未登录 → 截图 `out/collect/need_login<tag>.png`
+  + `sys.exit(3)`（驱动层中止全流程）。
+- `login.py` **保留但降级为可选辅助**（想在另一个终端先扫码时用）：
+  ```bash
+  "$PY" login.py --check     # 只检查，输出「已登录 / 需要重新登录」
+  "$PY" login.py             # 打开浏览器调出二维码，等用户扫码（默认最长 900 秒）
+  ```
+  - `WAIT_SEC` 可调等待秒数（默认 900）；`POLL_SEC` 轮询间隔（默认 5）。
+  - **`login.py` 两条加固（00:57 实测补上）**：
+    1. 登录态判定**遍历所有标签页**（登录常在新标签页完成），命中后自动回
+       `daren-square` 复核；
+    2. 若当前页没出二维码（既无「扫码」字样也无 ≥120px 大图）→ **兜底新开标签页
+       直开 `https://buyin.jinritemai.com/login`**。
+       ⚠️ 实测在抖音电商 marketing 落地页上**点「登录」是不出二维码的**，所以必须有这条兜底。
+  - 二维码/超时都落多张截图 `login_qr_*.png` / `login_timeout_*.png`。
+  - ⚠️ `login.py` 等待期间**不会反复刷新页面**（否则会把二维码刷掉）；
+    在浏览器里**干净关闭**才能把 cookie 落盘。
 - ⚠️ 用户不在机器旁时别干等：`screenshot_desktop()`（`.probe/win_io.py`）全黑 = 屏幕锁定/息屏。
 
 **退出码约定**
@@ -71,7 +85,7 @@ PY="/c/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.ex
 |---|---|---|
 | 0 | 正常结束 | 读取 `darens_<tag>.json` |
 | 2 | **类目按钮没点到**（页面布局/渲染抖动） | 冷却 `CATE_RETRY_WAIT`（45s）后重试 |
-| 3 | **登录态失效** | 中止整个流程，提示跑 `login.py` |
+| 3 | **等满 `LOGIN_WAIT_SEC` 仍未登录** | 中止整个流程；调大 `LOGIN_WAIT_SEC` 或先跑可选辅助 `login.py` |
 
 **运行（双类目：15 个个护家清 + 15 个美妆）**
 ```bash
@@ -219,7 +233,8 @@ export BATCH_COOLDOWN=300 MAX_RETRY=3      # 批次冷却 + 限流重试
   一个批次空转 40 个候选人、0 收获）。
 - 已内置：连续 4 次「上下文损坏」类异常 → `restart_browser()`
   重启 Edge 并重新挂响应监听，之后继续跑。
-- ⚠️ 但**重启浏览器不能恢复登录**：登录态过期只能跑 `login.py` 重新扫码。
+- ⚠️ 但**重启浏览器不能恢复登录**：登录态过期时，让使用者在重启后打开的 Edge
+  窗口里手动登录即可（采集器会等待），或可选跑 `login.py` 重新扫码。
 
 **⚠️ 类目按钮定位（2026-09-15 加固）**
 - 早先 `FIND_CATE_JS` 用固定 y 区间 `[240,350]` 圈定筛选栏；

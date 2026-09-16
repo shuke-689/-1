@@ -90,6 +90,16 @@ SCROLL_PAUSE = float(os.environ.get("SCROLL_PAUSE", "2.8"))    # 每屏滚动后
 # 【规则5】取满多少个「有效达人」（成功取到联系方式）即停止筛选
 TARGET_DAREN = int(os.environ.get("TARGET_DAREN", "30"))
 
+# 【登录策略】用户 2026-09-16 定：**跳过自动登录环节**。
+# 达人广场检测到未登录时**不中止**，而是在原地等待使用者在**已打开的 Edge 窗口**里
+# 手动登录（会话持久化在 .edge-auto/profile，下次无需重复），检测到即自动继续。
+#   LOGIN_WAIT_SEC=600   等待上限（秒）；设 0 = 不等待，检测到未登录立刻按退出码 3 退出
+#   LOGIN_POLL_SEC=5     轮询间隔（秒）
+LOGIN_WAIT_SEC = int(os.environ.get("LOGIN_WAIT_SEC", "600"))
+LOGIN_POLL_SEC = float(os.environ.get("LOGIN_POLL_SEC", "5"))
+# 登录后达人广场才会出现的字样（与 login.py 保持一致）
+LOGGED_IN_MARK = ("主推类目", "找达人", "按商品找达人")
+
 # 【筛选】结算总额 —— 用户 2026-09-15 由「视频结算总额」改为「结算总额」
 # 字段名（实测自 /square_pc_api/square/filter）：
 #   结算总额       common_range_selection_author_sale_gmv_30d_settle  （tooltip: 近30天达人所有带货来源的总结算额）
@@ -728,33 +738,89 @@ def main():
         page.goto(DAREN, wait_until="domcontentloaded", timeout=90_000)
         time.sleep(9)
 
-        # ---------- 登录态预检 ----------
+        # ---------- 登录态检查（用户 2026-09-16：跳过自动登录，等使用者自己登） ----------
         # 登录过期后 daren-square 会跳到抖音电商公开落地页（右上角「登录」），
         # 后续只会表现为「未找到类目按钮」——很容易误判成选择器坏了。
-        # 这里先明确判定，并给出可直接执行的修复命令。
-        body = ""
-        for _t in range(5):
-            try:
-                body = page.evaluate("() => (document.body.innerText || '').slice(0, 4000)")
-                if body.strip():
-                    break
-            except Exception:
-                body = ""
-            time.sleep(2.5)     # 页面可能正在跳转（落地页 -> 登录页）
-        if not any(m in body for m in ("主推类目", "找达人", "按商品找达人")):
-            log("!! 登录态已失效：达人广场跳到了公开落地页（未见「主推类目/找达人」）")
-            log("!! 请先重新登录：  python login.py   （用抖音 App 扫码）")
+        # 现在的策略：**不自动登录、不立刻中止**，在原地等使用者在已打开的 Edge
+        # 窗口里手动登录（会话持久化在 .edge-auto/profile），检测到就继续采集。
+        def _page_body():
+            for _t in range(5):
+                try:
+                    b = page.evaluate(
+                        "() => (document.body.innerText || '').slice(0, 4000)")
+                    if b and b.strip():
+                        return b
+                except Exception:
+                    pass
+                time.sleep(2.5)     # 页面可能正在跳转（落地页 -> 登录页）
+            return ""
+
+        def wait_manual_login():
+            """检测到未登录时原地等使用者手动登录。返回 (是否已登录, 诊断串)。"""
+            body = _page_body()
+            hit = [m for m in LOGGED_IN_MARK if m in body]
+            if hit:
+                return True, "已登录（命中 %s）" % "/".join(hit)
+            if LOGIN_WAIT_SEC <= 0:
+                return False, "未登录，且 LOGIN_WAIT_SEC=0（按设置不等待）"
+
+            log("!" * 66)
+            log("!! 当前未登录精选联盟（达人广场被跳到了公开落地页）")
+            log("!! 按你的设置：**跳过自动登录环节** —— 请直接在**刚打开的 Edge 窗口**里")
+            log("!!   手动登录（扫码 / 账号密码都行）。会话会存进 .edge-auto/profile，")
+            log("!!   以后就不需要再登了。登录成功后本脚本会自动继续，无需其他操作。")
+            log("!! 这里最多等 %d 秒。" % LOGIN_WAIT_SEC)
+            log("!" * 66)
             try:
                 page.screenshot(path=os.path.join(OUT, "need_login%s.png" % OUT_TAG))
-                log("!! 已截图 out/collect/need_login%s.png" % OUT_TAG)
+                log("   （已截图 out/collect/need_login%s.png 备查）" % OUT_TAG)
             except Exception:
                 pass
+
+            t0 = time.time()
+            n = 0
+            while time.time() - t0 < LOGIN_WAIT_SEC:
+                time.sleep(LOGIN_POLL_SEC)
+                n += 1
+                try:
+                    body = page.evaluate(
+                        "() => (document.body.innerText || '').slice(0, 4000)") or ""
+                except Exception:
+                    body = ""
+                hit = [m for m in LOGGED_IN_MARK if m in body]
+                if not hit:
+                    if n % 6 == 0:
+                        log("   …仍在等待手动登录（已等 %d/%d 秒）"
+                            % (int(time.time() - t0), LOGIN_WAIT_SEC))
+                    continue
+                log("✅ 检测到已登录（命中 %s），等了 %d 秒，继续采集。"
+                    % ("/".join(hit), int(time.time() - t0)))
+                # 登录常在新标签页完成 -> 回到达人广场复核一次再往下走
+                try:
+                    page.goto(DAREN, wait_until="domcontentloaded", timeout=90_000)
+                    time.sleep(6)
+                    b2 = page.evaluate(
+                        "() => (document.body.innerText || '').slice(0, 4000)") or ""
+                    if any(m in b2 for m in LOGGED_IN_MARK):
+                        log("   已回到达人广场，复核通过。")
+                        return True, "已登录"
+                    log("   ⚠️ 达人广场复核未通过，继续等待……")
+                except Exception as e:
+                    log("   复核时出错（忽略，继续等）：%s" % str(e)[:80])
+                t0 = time.time()        # 复核没过 -> 重新计时
+            return False, "等待 %d 秒仍未检测到登录" % LOGIN_WAIT_SEC
+
+        login_ok, login_why = wait_manual_login()
+        if not login_ok:
+            log("!! %s" % login_why)
+            log("!! 可选：也可以先在另一个终端跑  python login.py  扫码，再重跑本脚本。")
             time.sleep(2)
             try:
                 ctx.close()
             except Exception:
                 pass
-            sys.exit(3)          # 退出码 3 = 需要重新登录（驱动层应整体中止）
+            sys.exit(3)          # 退出码 3 = 一直没登录上（驱动层应整体中止）
+        log("登录态正常：%s" % login_why)
 
         log("应用筛选：类目 = %s" % " > ".join("/".join(c) for c in CATES))
         cate_ok = False

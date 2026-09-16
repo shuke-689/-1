@@ -22,6 +22,12 @@
   BATCH_COOLDOWN  批次间冷却秒数（默认 300）
   MAX_RETRY       单批限流重试次数（默认 3）
   MAX_SCROLL / MAX_CANDIDATE / SAME_BRAND_RATIO / DAREN_PAUSE 透传给 collect.py
+
+登录（用户 2026-09-16 定：跳过自动登录）：
+  本驱动**不会**去跑 login.py。collect.py 发现未登录时会停在原地，打印提示，
+  等你在**它已经打开的 Edge 窗口**里手动登录（会话存进 .edge-auto/profile），
+  检测到就自动继续。等待上限由 LOGIN_WAIT_SEC 控制（默认 600 秒），
+  透传给 collect.py；设 0 = 不等待。
 """
 import io
 import json
@@ -98,8 +104,8 @@ def run_batch(parent, tag, target):
     for attempt in range(1, MAX_RETRY + 2):
         rc, limited, dt = run_once(parent, tag, target)
         if rc == 3:
-            # 登录态失效：重试没有意义，交给上层整体中止
-            log("<<< %s 批中止：精选联盟登录态已失效" % parent)
+            # 登录态一直没登上（collect.py 已按 LOGIN_WAIT_SEC 等待使用者手动登录）
+            log("<<< %s 批中止：一直没检测到精选联盟登录" % parent)
             NEED_LOGIN["v"] = True
             return []
         if limited and attempt <= MAX_RETRY:
@@ -144,8 +150,10 @@ def main():
             time.sleep(BATCH_COOLDOWN)
         all_recs.extend(run_batch(parent, tag, target))
         if NEED_LOGIN["v"]:
-            log("!! 精选联盟登录态失效 -> 中止整个采集流程")
-            log("!! 请先执行：  python login.py   （扫码登录后）再重跑 python collect_30.py")
+            log("!! 一直没检测到精选联盟登录 -> 中止整个采集流程")
+            log("!! collect.py 已在你打开的 Edge 窗口里等待；若超时了，可加大等待时间：")
+            log("!!   LOGIN_WAIT_SEC=1800 python collect_30.py")
+            log("!! 或先在另一个终端跑  python login.py  扫码，再重跑本脚本。")
             return
 
     # 按 uid 去重（同一达人可能同时挂个护家清和美妆）

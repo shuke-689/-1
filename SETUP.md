@@ -23,7 +23,7 @@
 
 ---
 
-## 1. 五步跑起来
+## 1. 四步跑起来
 
 ```bash
 # ① 进入项目目录，加载可移植环境
@@ -34,15 +34,24 @@ source tools/env.sh
 "$PY" setup_env.py
 "$PY" setup_env.py --check        # 期望：全部依赖就绪 + 找到 Microsoft Edge
 
-# ③ 登录你自己的精选联盟账号（会弹 Edge，用抖音 App 扫码）
-"$PY" login.py
-
-# ④ 跑规则单测，确认代码完好
+# ③ 跑规则单测，确认代码完好
 "$PY" .probe/test_rules.py && "$PY" .probe/test_brand.py
 
-# ⑤ 开始干活
+# ④ 开始干活（登录会自己处理，见下方说明）
 "$PY" collect_30.py               # 阶段A：15 个个护家清 + 15 个美妆
 ```
+
+> **关于登录**：采集器**不需要你预先登录**。它自己判断登录态 ——
+> 已登录就直接跑；没登录就在日志里打印「当前未登录精选联盟」，
+> 然后**在原地等你**，你只要在**它已经打开的那个 Edge 窗口**里登录一下
+> （扫码 / 账号密码都行），检测到就自动继续。会话存进 `.edge-auto/profile`，
+> 以后长期有效。等太久没登就调大 `LOGIN_WAIT_SEC`（默认 600 秒）：
+>
+> ```bash
+> LOGIN_WAIT_SEC=1800 "$PY" collect_30.py
+> ```
+>
+> `"$PY" login.py` 仍然可用，但只是**可选辅助**（想在另一个终端先扫码时用）。
 
 微信端：先登录微信、打开「+」→「添加朋友」窗口，然后
 
@@ -99,7 +108,9 @@ source tools/env.sh
 > 详细流程、平台选择、冲突处理：见
 > `.workbuddy/skills/douyin-xuanlian-wechat/references/SYNC.md`
 >
-> **账号绝不共享**：好友 clone 后必须跑 `login.py` 扫**自己的**码，用**自己的**微信。
+> **账号绝不共享**：登录态在各自的 `.edge-auto/` 里、**不随 git 同步**。
+> 好友**首次跑采集时，在采集器打开的 Edge 窗口里登录自己的账号**即可（无需预先跑 `login.py`），
+> 微信也要用**自己的**客户端。
 
 ---
 
@@ -107,7 +118,8 @@ source tools/env.sh
 
 | 症状 | 先做 |
 |---|---|
-| 采集报「未找到类目按钮」 | `"$PY" login.py --check` —— 十有八九是登录过期 |
+| 日志出现「当前未登录精选联盟」 | **这不是报错**，是正常等待 → 去它打开的 Edge 窗口里登录；等满 `LOGIN_WAIT_SEC` 才退出 |
+| 采集报「未找到类目按钮」 | 看 `out/collect/need_login*.png`；十有八九是页面布局变化或登录判定漏判（`login.py --check` 可辅助确认） |
 | 页面显示「未找到相关达人，请调整筛选后重试」 | **平台限流 11001**，不是没数据；等 5 分钟再跑 |
 | 报 `No module named xxx` | `"$PY" setup_env.py` |
 | `git: command not found` | 用 `source tools/env.sh` 后再跑，或看 `tools/env.sh` 探到的 `$GIT` |
