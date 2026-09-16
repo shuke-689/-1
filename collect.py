@@ -99,9 +99,21 @@ LOGIN_WAIT_SEC = int(os.environ.get("LOGIN_WAIT_SEC", "600"))
 LOGIN_POLL_SEC = float(os.environ.get("LOGIN_POLL_SEC", "5"))
 # 登录后达人广场才会出现的字样（与 login.py 保持一致）
 LOGGED_IN_MARK = ("主推类目", "找达人", "按商品找达人")
-# 官方登录页：实测在抖音电商 marketing 落地页上点「登录」**不出二维码**，
-# 所以未登录时直接把使用者送到这个地址（与 login.py 的兜底一致）
-LOGIN_URL = os.environ.get("LOGIN_URL", "https://buyin.jinritemai.com/login")
+# 官方登录页（**候选列表，按顺序试，挑第一个可用的**）
+#   ⚠️ 实测 2026-09-16：`https://buyin.jinritemai.com/login` 已经 **404（nginx）**，
+#      所以不能硬编码它。`fxg.jinritemai.com/login/common?from=buyin` 实测可用
+#      （标题「抖店登录」，含扫码/验证码登录；同域 *.jinritemai.com，cookie 通用）。
+# 覆盖方式：export LOGIN_URL=<你的地址>（会排在最前）
+LOGIN_URLS = tuple(u for u in (
+    os.environ.get("LOGIN_URL", ""),
+    "https://fxg.jinritemai.com/login/common?from=buyin",
+    "https://buyin.jinritemai.com/login",
+) if u)
+# 判断「这个页面像不像登录页」：命中 GOOD 且未命中 BAD 才算可用
+#   ⚠️ GOOD 里**不要**放「登录」二字 —— 抖音电商 marketing 落地页右上角就有「登录」
+#      按钮，会把它误判成登录页；要用「验证码 / 扫码」这类只有真登录页才有的字样。
+LOGIN_PAGE_GOOD = ("验证码", "扫码", "二维码", "账号登录", "密码登录")
+LOGIN_PAGE_BAD = ("404 Not Found", "not found", "nginx")
 
 # 【筛选】结算总额 —— 用户 2026-09-15 由「视频结算总额」改为「结算总额」
 # 字段名（实测自 /square_pc_api/square/filter）：
@@ -801,20 +813,38 @@ def main():
             log("!" * 66)
             _shot_all("need_login")
 
-            # 主动把官方登录页开出来：对着 marketing 落地页使用者会找不到登录入口
+            # 主动把**可用的登录页**开出来：对着 marketing 落地页使用者找不到入口，
+            # 而 buyin.jinritemai.com/login 已 404 —— 所以逐个候选试。
             try:
                 lp = ctx.new_page()
-                lp.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
+                picked = ""
+                for u in LOGIN_URLS:
+                    try:
+                        lp.goto(u, wait_until="domcontentloaded", timeout=60_000)
+                    except Exception as e:
+                        log("   ⚠️ 打开 %s 失败：%s" % (u, str(e)[:70]))
+                        continue
+                    bb = _body_of(lp, tries=3)
+                    bad = any(m in bb for m in LOGIN_PAGE_BAD)
+                    good = any(m in bb for m in LOGIN_PAGE_GOOD)
+                    if good and not bad:
+                        picked = u
+                        break
+                    log("   ⚠️ %s 不可用（%s），换下一个…"
+                        % (u, "404/错误页" if bad else "未见登录表单"))
+                if picked:
+                    log("   ✅ 已在浏览器里打开登录页：%s" % picked)
+                    log("      请在**那个 Edge 窗口**里登录（扫码 / 验证码都行），"
+                        "本脚本不用管。")
+                else:
+                    log("   ⚠️ 候选登录页都不可用，请在 Edge 地址栏手动打开登录页。")
                 try:
                     lp.bring_to_front()
                 except Exception:
                     pass
-                log("   ✅ 已在浏览器里打开登录页：%s" % LOGIN_URL)
-                log("      请在**那个 Edge 窗口**里登录（扫码 / 账号密码都行），"
-                    "本脚本不用管。")
             except Exception as e:
                 log("   ⚠️ 自动打开登录页失败：%s" % str(e)[:100])
-                log("      请在 Edge 地址栏手动输入：%s" % LOGIN_URL)
+                log("      请在 Edge 地址栏手动打开登录页。")
 
             t0 = time.time()
             n = 0

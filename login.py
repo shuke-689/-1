@@ -36,8 +36,18 @@ POLL_SEC = int(os.environ.get("POLL_SEC", "5"))
 # 只有登录后的达人广场才会出现这些字样
 LOGGED_IN_MARK = ("主推类目", "找达人", "按商品找达人")
 
-# 巨量百应登录页（比在 marketing 落地页上找「登录」按钮更可靠）
-LOGIN_URL = os.environ.get("LOGIN_URL", "https://buyin.jinritemai.com/login")
+# 官方登录页（候选列表，按顺序试，挑第一个可用的）
+#   ⚠️ 2026-09-16 实测：`https://buyin.jinritemai.com/login` 已 **404（nginx）**，
+#      不能再当唯一兜底。`fxg.jinritemai.com/login/common?from=buyin` 实测可用
+#      （标题「抖店登录-抖店后台-抖音电商后台」，含扫码/验证码登录；
+#       同域 *.jinritemai.com，cookie 通用）。
+LOGIN_URLS = tuple(u for u in (
+    os.environ.get("LOGIN_URL", ""),
+    "https://fxg.jinritemai.com/login/common?from=buyin",
+    "https://buyin.jinritemai.com/login",
+) if u)
+LOGIN_PAGE_GOOD = ("验证码", "扫码", "二维码", "账号登录", "密码登录")
+LOGIN_PAGE_BAD = ("404 Not Found", "not found", "nginx")
 
 CLICK_LOGIN_JS = """() => {
     let hit = null;
@@ -187,11 +197,32 @@ def main():
             need_fallback = (not clicked) or (not qr) or \
                             (qr and not qr.get("hasScanWord") and qr.get("bigImg", 0) == 0)
             if need_fallback:
-                print("当前页未出现二维码 -> 打开官方登录地址：%s" % LOGIN_URL)
                 try:
                     lp = ctx.new_page()
-                    lp.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
-                    time.sleep(6)
+                    picked = ""
+                    for u in LOGIN_URLS:
+                        try:
+                            lp.goto(u, wait_until="domcontentloaded", timeout=60_000)
+                        except Exception as e:
+                            print("打开 %s 失败：%s" % (u, str(e)[:80]))
+                            continue
+                        time.sleep(5)
+                        try:
+                            b = lp.evaluate(
+                                "() => (document.body.innerText || '').slice(0, 4000)")
+                        except Exception:
+                            b = ""
+                        bad = any(m in b for m in LOGIN_PAGE_BAD)
+                        good = any(m in b for m in LOGIN_PAGE_GOOD)
+                        if good and not bad:
+                            picked = u
+                            break
+                        print("  %s 不可用（%s），换下一个…"
+                              % (u, "404/错误页" if bad else "未见登录表单"))
+                    if picked:
+                        print("已打开可用登录地址：%s" % picked)
+                    else:
+                        print("候选登录地址都不可用，请在地址栏手动打开登录页。")
                     try:
                         lp.bring_to_front()
                     except Exception:

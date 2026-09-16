@@ -48,16 +48,33 @@ PY="/c/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.ex
 
 **不再把 `login.py` 作为流程前置。** 采集器自己判断登录态：
 - 已登录 → 直接开筛；
-- 未登录 → **不中止**，会**主动 `ctx.new_page()` 打开官方登录页
-  `https://buyin.jinritemai.com/login` 并 `bring_to_front()`**（实测在 marketing
-  落地页上点「登录」不出二维码，所以直接送人到登录页），然后**停在原地等使用者
-  自己在那个 Edge 窗口里登录**；轮询是**遍历所有标签页**的（登录常在新标签页完成），
+- 未登录 → **不中止**，会**主动 `ctx.new_page()` 打开可用登录页并
+  `bring_to_front()`**，然后**停在原地等使用者自己在那个 Edge 窗口里登录**；
+  轮询是**遍历所有标签页**的（登录常在新标签页完成），
   命中后会 `goto` 回 `daren-square` 复核一次再往下走。
+
+🔴 **登录地址必须走候选列表（2026-09-16 踩到）**
+`https://buyin.jinritemai.com/login` **已经 404（nginx/1.14.1）**。
+当时未登录时把它打开，使用者看到的是一个 **404 白页**，自然登不进去
+（表现为傻等 30 分钟超时）。现在按顺序试，挑第一个「像登录页」的：
+
+```python
+LOGIN_URLS = (os.environ.get("LOGIN_URL",""),
+              "https://fxg.jinritemai.com/login/common?from=buyin",   # ✅ 实测可用
+              "https://buyin.jinritemai.com/login")                   # ❌ 已 404
+```
+- 可用地址：`https://fxg.jinritemai.com/login/common?from=buyin`
+  → 标题「抖店登录-抖店后台-抖音电商后台」，含**手机登录（手机号+验证码）/ 邮箱登录**。
+  同域 `*.jinritemai.com`，cookie 与 `buyin` 通用（`stage1_login_probe.py` 用的就是它）。
+- 判定「像不像登录页」：命中 `LOGIN_PAGE_GOOD` 且未命中 `LOGIN_PAGE_BAD`。
+  ⚠️ `LOGIN_PAGE_GOOD` 里**绝不能放「登录」二字** —— 抖音电商 marketing 落地页
+  右上角就有「登录」按钮，会把它误判成登录页。要用 `验证码 / 扫码 / 二维码` 这类
+  只有真登录页才有的字样。
 
 ```bash
 export LOGIN_WAIT_SEC=7200      # 等待上限（秒），默认 600；设 0 = 不等待，直接退出码 3
 export LOGIN_POLL_SEC=5         # 轮询间隔（秒）
-export LOGIN_URL=https://buyin.jinritemai.com/login   # 可覆盖登录页地址
+export LOGIN_URL=https://...    # 覆盖登录地址（会排到候选列表最前）
 ```
 
 - 判定依据：登录后页面正文必含「主推类目」「找达人」「按商品找达人」。

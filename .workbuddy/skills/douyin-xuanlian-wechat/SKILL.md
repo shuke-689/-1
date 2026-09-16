@@ -43,18 +43,25 @@ source tools/env.sh        # 自动探测 Python / PYTHONPATH / git，跨机器�
 
 **不要**主动去跑 `login.py`。直接启动采集即可 —— 采集器自己会判断登录态：
 - 已登录 → 直接开筛；
-- 未登录 → **不中止**，会**主动在浏览器里新开一个标签页打开官方登录页**
-  `https://buyin.jinritemai.com/login` 并 `bring_to_front()`，
-  然后停在原地等你手动登录（会话存进 `.edge-auto/profile`，之后长期有效），
-  检测到就自动继续。
+- 未登录 → **不中止**，会**主动在浏览器里新开一个标签页打开可用登录页**并
+  `bring_to_front()`，然后停在原地等你手动登录（会话存进 `.edge-auto/profile`，
+  之后长期有效），检测到就自动继续。
 
 所以要做的只有一件事：**采集启动后，如果日志出现「当前未登录精选联盟」，
-就在它已经打开的那个 Edge 窗口里自己登录一下**（扫码 / 账号密码都行）。
+就在它已经打开的那个 Edge 窗口里自己登录一下**（手机号+验证码 / 邮箱登录）。
 ⚠️ 必须在**自动化那个 Edge 窗口**里登，在你自己平时用的浏览器里登是没用的
 （cookie 不在 `.edge-auto/profile`）。
 
-为什么主动新开登录页：实测在抖音电商 marketing 落地页上**点「登录」不出二维码**，
-使用者对着落地页会找不到入口。
+🔴 **登录地址是候选列表，不要硬编码**（2026-09-16 踩到）：
+`https://buyin.jinritemai.com/login` **已 404（nginx）**，当时把它打开 → 使用者看到
+404 白页 → 傻等 30 分钟超时。现在按顺序试、挑第一个「像登录页」的：
+- ✅ `https://fxg.jinritemai.com/login/common?from=buyin`（标题「抖店登录」，
+  手机/邮箱登录，同域 cookie 通用）
+- ❌ `https://buyin.jinritemai.com/login`（404）
+
+判定用 `LOGIN_PAGE_GOOD = ("验证码","扫码","二维码","账号登录","密码登录")`
+且未命中 `LOGIN_PAGE_BAD = ("404 Not Found","not found","nginx")`。
+⚠️ GOOD 里**不能放「登录」二字** —— 营销落地页右上角就有「登录」按钮，会误判。
 
 等待上限由 `LOGIN_WAIT_SEC` 控制（默认 600 秒，可按需调大）：
 ```bash
