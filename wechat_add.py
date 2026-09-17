@@ -36,6 +36,7 @@ import time
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE)
 sys.path.insert(0, os.path.join(BASE, ".probe"))
 OUT = os.path.join(BASE, "out", "wechat")
 STEPS = os.path.join(OUT, "steps")
@@ -44,6 +45,7 @@ os.makedirs(STEPS, exist_ok=True)
 
 import win_io as w  # noqa: E402
 import ocr  # noqa: E402
+import nick_rules  # noqa: E402  规则7 词表（与 A / C 阶段共用，无副作用模块）
 
 NOT_FOUND_KW = ("用户不存在", "无法找到", "没有找到", "找不到相关账号", "找不到相关内容",
                 "请检查", "不存在", "找不到")
@@ -434,11 +436,35 @@ def fill_apply(nick, shown, idx, dry):
     return "sent"
 
 
+def _drop_nick_excluded(cand):
+    """【规则7 复核】把「昵称命中排除词」的候选剔除，返回 (保留, [(昵称, 命中词), ...])。
+
+    为什么不靠 A 阶段一次筛干净：
+      · 词表是**会长**的（2026-09-17 用户又加了 香港/假发/美甲/酒/染发/男士… 10 个），
+        而 `darens.json` 是上一次 A 阶段跑出来的**旧名单**，不会自动重筛；
+      · B 阶段的好友申请**发出去就撤不回**，所以宁可在这一步多挡一道。
+    词表实体在 `nick_rules.py`（纯数据+纯函数），A/B/C 三个阶段共用同一份。
+    """
+    keep, out = [], []
+    for d in cand:
+        hit = nick_rules.nick_exclude_kw_hit(d.get("nickname") or "")
+        if hit:
+            out.append((d.get("nickname") or "", hit))
+        else:
+            keep.append(d)
+    return keep, out
+
+
 def run(limit=0, dry=False):
     open(LOG, "w", encoding="utf-8").close()
     src = json.load(open(os.path.join(BASE, "out", "collect", "darens.json"), encoding="utf-8"))
     ledger = load_ledger()
     cand = [d for d in src if d.get("contact")]
+    # 【规则7 复核】昵称命中排除词的直接丢掉 ——
+    #   词表可能是在 A 阶段跑完之后才追加的（如 2026-09-17 加的那 10 个），
+    #   旧名单不会自动重筛，所以 B 阶段必须再用**现行**词表挡一道，
+    #   否则不该加的达人照样会被发出好友申请（不可撤销）。
+    cand, nick_out = _drop_nick_excluded(cand)
     todo = [d for d in cand
             if (ledger.get(d.get("uid")) or {}).get("add_status") not in DONE_STATUS]
     skipped = len(cand) - len(todo)
@@ -446,6 +472,9 @@ def run(limit=0, dry=False):
         todo = todo[:limit]
     log("候选 %d 个（已处理跳过 %d 个）-> 本轮待加 %d 个%s" % (
         len(cand), skipped, len(todo), "（dry 模式）" if dry else ""))
+    if nick_out:
+        log("其中 %d 个因**昵称命中排除词**被剔除：%s" % (
+            len(nick_out), " | ".join("%s(%s)" % (n[:16], h) for n, h in nick_out[:10])))
     if not todo:
         log("没有待加好友了（全部已处理）")
         return
@@ -530,10 +559,16 @@ def status():
     src = json.load(open(os.path.join(BASE, "out", "collect", "darens.json"), encoding="utf-8"))
     ledger = load_ledger()
     cand = [d for d in src if d.get("contact")]
+    # 与 run() 保持一致：先过一遍规则7，否则 status 会列出**实际不会加**的人
+    # （曾出现「status 说待加 25 个，run 只加 22 个」的迷惑现象）
+    cand, nick_out = _drop_nick_excluded(cand)
     left = [d for d in cand if (ledger.get(d.get("uid")) or {}).get("add_status")
             not in DONE_STATUS]
     from collections import Counter
     log("候选达人 %d 个 / 台账 %d 条 / 剩余待加 %d 个" % (len(cand), len(ledger), len(left)))
+    if nick_out:
+        log("（另有 %d 个因昵称命中排除词不计入待加：%s）" % (
+            len(nick_out), " | ".join("%s(%s)" % (n[:14], h) for n, h in nick_out[:10])))
     log("台账状态分布: %s" % dict(Counter(
         (r.get("add_status") or "?") for r in ledger.values())))
     for d in left:

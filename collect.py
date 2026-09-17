@@ -242,8 +242,9 @@ CONTENT_EXCLUDE = (
 )
 
 # 【规则7】昵称命中以下词 -> 排除（渠道 / 供应链 / 机构 / 品牌号特征）
-NICK_EXCLUDE_KW = ("国际", "全球", "美业", "供应链", "折扣", "厂家",
-                   "大牌", "养发", "集团", "防晒")
+#   ⚠️ 词表已抽到**无副作用的独立模块** `nick_rules.py`（在文件上方统一 import），
+#      因为阶段 B（微信加好友）和阶段 C（登记飞书）也必须用同一份词表再挡一道
+#      （旧名单不会自动重筛）。追加/修改词表请改 `nick_rules.py`，别在这里重复定义。
 
 # 【规则7b】昵称带品牌名 -> 排除
 #   ① 号名里出现这些词，基本可判定是「品牌号 / 店铺号 / 渠道号」
@@ -299,6 +300,9 @@ def log(m):
 
 sys.path.insert(0, BASE)
 import darens_io          # noqa: E402  （输出 json/csv/xlsx 的公共模块）
+import douyin_id as DID   # noqa: E402  （点「达人抖音主页」取抖音号，登记飞书要用）
+import nick_rules         # noqa: E402  （昵称排除词，A/B/C 三阶段共用）
+NICK_EXCLUDE_KW = nick_rules.NICK_EXCLUDE_KW
 
 
 def write_outputs(records, tag=""):
@@ -1853,6 +1857,18 @@ def main():
             r["contact_type"] = got_type
             if got_val:
                 valid_n += 1
+            # 【登记飞书用】取达人抖音号：点「达人抖音主页」→ 读抖音主页上的「抖音号」
+            #   只对**取到联系方式的**达人取（省时间；没联系方式的也不会登记）
+            #   ⚠️ 内部有防串号校验（点击前先确认主页是本人），失败返回空串，绝不写可疑值
+            if got_val and not r.get("douyin_id"):
+                try:
+                    r["douyin_id"], r["douyin_nick"] = DID.fetch(
+                        page, ctx, r["nickname"], log=log)
+                except Exception as e:
+                    log("   [%d/%d] %s 取抖音号异常: %s" % (
+                        i, cand_n, r["nickname"], str(e)[:70]))
+                log("   [%d/%d] %-22s 抖音号=%s" % (
+                    i, cand_n, (r["nickname"] or "")[:20], r.get("douyin_id") or "✗ 未取到"))
             done.append(r)
             tail = ("跳过·" + r["skip_reason"]) if r.get("skip_reason") else (got_val or "✗ 未取到")
             log("   [%d/%d] %-22s %-12s 粉丝=%-7s %s=%s  (有效 %d/%d)" % (
