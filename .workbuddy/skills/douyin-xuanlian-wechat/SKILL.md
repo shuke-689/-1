@@ -23,6 +23,17 @@ source tools/env.sh        # 自动探测 Python / PYTHONPATH / git，跨机器�
 `tools/env.sh` 会导出：`$PY`（托管 Python）、`$PYTHONPATH`（`.probe/libs`）、`$GIT`。
 **不要**再手写 `C:\Users\Administrator\...` 这类绝对路径——那是原作者的机器路径。
 
+⚠️ **后台跑长任务时要显式带上 PATH**：后台命令**不继承**前台 `export` 过的环境
+（shell 状态不持久），只写 `bash tools/run_b_rounds.sh` 会立刻
+`bash: command not found`。写法是把 export 和命令放进**同一条**命令：
+```bash
+export PATH="/c/Users/<你>/.workbuddy/binaries/PortableGit/versions/1.2.0/cmd:\
+/c/Users/<你>/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:/c/Windows/System32:/c/Windows:$PATH" \
+  && cd "C:/Users/<你>/WorkBuddy/抖音" && bash tools/run_b_rounds.sh 10 30 60 2>&1
+```
+（阶段A 的长跑任务同理。`tools/env.sh` 是在脚本**内部**补 PATH，所以只要 `bash` 本身
+能找到就行。）
+
 首次使用（或换机器）先跑一次：
 
 ```bash

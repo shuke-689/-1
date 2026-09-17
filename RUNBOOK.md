@@ -34,6 +34,14 @@ PY="/c/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.ex
 - PowerShell 工具在此环境**无 stdout 输出** → 一律用 Bash。
 - `reg.exe` 被安全策略黑名单拦截。
 - **Bash 命令结束时其派生的后台进程会被回收** → 长流程必须放进**一个** `run_in_background` 任务里跑。
+- 🔴 **后台任务不继承前台 `export` 过的环境**（shell 状态不持久）：只写
+  `bash tools/run_b_rounds.sh` 会立刻 `bash: command not found`（`bash` 不在默认 PATH 里）。
+  正确写法是把 `export PATH=...` 和命令放进**同一条**命令：
+  ```bash
+  export PATH="/c/Users/Administrator/.workbuddy/binaries/PortableGit/versions/1.2.0/cmd:/c/Users/Administrator/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:/c/Windows/System32:/c/Windows:$PATH" && cd "C:/Users/Administrator/WorkBuddy/抖音" && bash tools/run_b_rounds.sh 10 30 60 2>&1
+  ```
+  （阶段A 的 `collect_30.py` 长跑也是这么发的；`tools/env.sh` 在脚本**内部**补 PATH，
+  所以只要 `bash` 本身找得到就行。）
 - 屏幕 3840x2160 单屏，坐标 = 物理像素。
 
 ---
