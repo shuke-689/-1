@@ -171,7 +171,7 @@ export BATCH_COOLDOWN=300 MAX_RETRY=3      # 批次冷却 + 限流重试
 | **规则4** | 达人主推类目必须命中 **个护家清 或 美妆** 其一；目标词条 = 个护家清 / 美妆 / 服饰内衣 / 母婴宠物 / 运动户外。<br>· 命中 **≥2 个** → 通过，**第三个及以后的类目不做任何限制**<br>&nbsp;&nbsp;（例：`个护家清/母婴宠物/食品饮料` ✔、`个护家清/美妆/食品饮料` ✔）<br>· 只命中 **1 个** → 带下列 **18 个搭档类目**任一即排除：食品饮料 / 滋补保健 / 宠物 / 图书教育 / 生鲜 / 本地生活 / 酒 / 智能家居 / 玩具乐器 / 鲜花园艺 / 3C数码家电 / 鞋靴箱包 / 虚拟充值 / 钟表配饰 / 珠宝文玩 / 医疗健康 / 原料包装 / 餐饮外卖 | 本地过滤 `cate_verdict(main_cate)`；`author_tag.main_cate` 是**顶级类目名数组**，如实测 `["个护家清","服饰内衣","美妆"]` |
 | **规则6** | 达人**内容类型**不得为下列 **16 种**任一：三农 / 公益 / 人文社科 / 二次元 / 医疗健康 / 动物 / 教育校园 / 汽车 / 游戏 / 生活家居 / 社会时政 / 科技 / 科普 / 美食 / 职场 / 财经 | 本地过滤 `author_tag.author_label_rec_reasons[].reason`（**覆盖率实测 100%**；字段值＝平台「内容类型」选项名，共 40 项）|
 | **规则5** | 每批取满 **TARGET_DAREN（15）个有效达人** 即停止该批 | 主循环里 `valid_n >= TARGET_DAREN` 就 `break` |
-| | **结算总额 = 1w-10w**（2026-09-15 由「视频结算总额」改） | `common_range_selection_author_sale_gmv_30d_settle:["2"]` |
+| | **直播结算总额 = 1w-10w**（2026-09-16 由「结算总额」改） | `common_range_selection_live_sales_30d_settle:["2"]` |
 | | 粉丝量 = 10w 以下 | `fans_num:["1"]` |
 | | 有联系方式 | `has_contact:true` |
 | **规则3a** | 达人主页「带货分析」：**同一品牌占比 ≥ 50%**（且严格过半）→ 跳过 | `brand_verdict()`，阈值 `SAME_BRAND_RATIO`（默认 0.50）|
@@ -181,16 +181,24 @@ export BATCH_COOLDOWN=300 MAX_RETRY=3      # 批次冷却 + 限流重试
 
 | 界面名称 | 接口字段 |
 |---|---|
-| **结算总额**（全部带货来源） | `common_range_selection_author_sale_gmv_30d_settle` |
-| 直播结算总额 | `common_range_selection_live_sales_30d_settle` |
+| **直播结算总额**（只算直播带货）← **当前在用** | `common_range_selection_live_sales_30d_settle` |
+| 结算总额（全部带货来源） | `common_range_selection_author_sale_gmv_30d_settle` |
 | 视频结算总额 | `common_range_selection_video_sales_30d_settle` |
 | 图文结算总额 | `common_range_selection_picture_sales_30d_settle` |
 | 橱窗结算总额 | `common_range_selection_window_sales_30d_settle` |
 | 场均结算额 | `common_range_selection_author_square_average_gmv_settle` |
 | 单视频结算额 | `common_range_selection_author_single_video_gmv_settle` |
 
-> 区间选项文本统一为 `1w以下 / 1w-10w / 10w-100w / 100w-500w / 500w-1000w / 1000w以上`（value 1~6）。
-> `FIND_FORMITEM_JS` 是**精确匹配**（`innerText !== name`），所以「结算总额」不会误撞「视频结算总额」。
+> 口径沿革：视频结算总额 → 结算总额（09-15）→ **直播结算总额（09-16）**。
+> 切到直播口径后，**纯短视频/图文达人会被排除**（`settle_live` 为 `0-0`），这是预期行为。
+>
+> 区间选项统一为 `1w以下 / 1w-10w / 10w-100w / 100w-500w / 500w-1000w / 1000w以上`（value 1~6）。
+> ⚠️ **没有 5000 档** —— 用户 09-16 曾要求「直播结算总额 5000-10w」，
+> 但平台只提供这 6 档（实测 `out/stage5/filter.json`），最终确认落回 `1w-10w`。
+> （数据侧 `sale_info` 虽是数值区间、粒度够细，但平台筛选做不到 5000 起。）
+> ✅ 该下拉是**多选**（探针 `.probe/probe_sale_multiselect.py` 实测：勾 `1w以下`+`1w-10w`
+> 会发 `["1","2"]`）—— 将来若真要拼超集区间，可用 `SALE_OPTION="1w以下|1w-10w"` 多选再本地过滤。
+> `FIND_FORMITEM_JS` 是**精确匹配**（`innerText !== name`），所以「结算总额」不会误撞「直播结算总额」。
 > 达人详情里的实际数值在接口 `sale_info.*`：
 > `total_sales_settle` / `live_total_sales_settle` / `video_total_sales_settle` / `image_text_total_sales_settle`
 > （各含 `sale_low` / `sale_high` 区间）。

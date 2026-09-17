@@ -17,9 +17,12 @@
             且「个护家清/美妆/服饰内衣/母婴宠物/运动户外」命中 >= 2 个时，
             第三个及以后的类目**不做任何限制**
             （如 个护家清/母婴宠物/食品饮料 ✔、个护家清/美妆/食品饮料 ✔）
-  【规则2】结算总额 = 1w-10w   ← 用户 2026-09-15 由「视频结算总额」改为「结算总额」
-          字段 common_range_selection_author_sale_gmv_30d_settle
-          （近30天所有带货来源，不限定直播/短视频）
+  【规则2】直播结算总额 = 1w-10w   ← 用户 2026-09-16 由「结算总额」改为「直播结算总额」
+          字段 common_range_selection_live_sales_30d_settle
+          （口径变化：只认直播带货的结算额；settle_live 为 0 的纯短视频/图文达人会被排除）
+          历史：2026-09-15 之前是「视频结算总额」，09-15 改「结算总额」，09-16 改「直播结算总额」
+          ⚠️ 用户 09-16 还要求过 5000-10w，但平台下拉只有 6 档、最细是「1w以下」，
+             没有 5000 档 -> 用户确认落回 1w-10w
   粉丝量 = 10w以下
   有联系方式 = 勾选
 本地过滤：
@@ -115,17 +118,22 @@ LOGIN_URLS = tuple(u for u in (
 LOGIN_PAGE_GOOD = ("验证码", "扫码", "二维码", "账号登录", "密码登录")
 LOGIN_PAGE_BAD = ("404 Not Found", "not found", "nginx")
 
-# 【筛选】结算总额 —— 用户 2026-09-15 由「视频结算总额」改为「结算总额」
+# 【筛选】直播结算总额 —— 用户 2026-09-16 由「结算总额」改为「直播结算总额」
+# 口径沿革：视频结算总额 -> 结算总额(09-15) -> 直播结算总额(09-16)
 # 字段名（实测自 /square_pc_api/square/filter）：
-#   结算总额       common_range_selection_author_sale_gmv_30d_settle  （tooltip: 近30天达人所有带货来源的总结算额）
-#   直播结算总额   common_range_selection_live_sales_30d_settle
+#   结算总额       common_range_selection_author_sale_gmv_30d_settle  （近30天所有带货来源的总结算额）
+#   直播结算总额   common_range_selection_live_sales_30d_settle   ← 当前在用
 #   视频结算总额   common_range_selection_video_sales_30d_settle
 #   图文结算总额   common_range_selection_picture_sales_30d_settle
 #   橱窗结算总额   common_range_selection_window_sales_30d_settle
 #   场均结算额     common_range_selection_author_square_average_gmv_settle
-# 注意：FIND_FORMITEM_JS 是**精确匹配**，所以「结算总额」不会误撞到「视频结算总额」。
-# 区间选项文本：1w以下 / 1w-10w / 10w-100w / 100w-500w / 500w-1000w / 1000w以上
-SALE_LABEL = os.environ.get("SALE_LABEL", "结算总额")
+# 注意：FIND_FORMITEM_JS 是**精确匹配**，所以「结算总额」不会误撞到「直播结算总额」。
+# 区间选项（6 档，实测自 out/stage5/filter.json 的 children）：
+#   全部 / 1w以下=1 / 1w-10w=2 / 10w-100w=3 / 100w-500w=4 / 500w-1000w=5 / 1000w以上=6
+#   ⚠️ 没有 5000 档；「5000-10w」无法直接选（数据侧虽是数值区间，但平台侧不支持）
+#   ✅ 该下拉是**多选**（探针 .probe/probe_sale_multiselect.py 实测：
+#      同时勾 1w以下+1w-10w 会发出 ['1','2']）—— 以后若真要拼区间，可以多选凑超集
+SALE_LABEL = os.environ.get("SALE_LABEL", "直播结算总额")
 SALE_OPTION = os.environ.get("SALE_OPTION", "1w-10w")
 
 # 【规则1】主推类目 = 「个护家清」（级联菜单里选「不限」= 整个个护家清大类）
@@ -942,9 +950,11 @@ def main():
             except Exception:
                 pass
             sys.exit(2)          # 退出码 2 = 类目没选中（驱动层可重试）
-        # 用户 2026-09-15 改：视频结算总额 -> **结算总额**（近30天所有带货来源的总结算额，
-        # 不限定直播/短视频）。对应接口字段 common_range_selection_author_sale_gmv_30d_settle。
-        apply_formitem(SALE_LABEL, SALE_OPTION, "sale")
+        # 用户 2026-09-16 改：结算总额 -> **直播结算总额 = 1w-10w**
+        # 字段 common_range_selection_live_sales_30d_settle（只认直播带货的结算额）。
+        # 单一选项，单选即可（该下拉支持多选，需要时可用逗号分隔传多个选项）。
+        for _opt in [o.strip() for o in SALE_OPTION.split("|") if o.strip()]:
+            apply_formitem(SALE_LABEL, _opt, "sale")
         apply_formitem("粉丝量", "10w以下", "fans")
         apply_formitem("有联系方式", None, "contact")
         time.sleep(4)
@@ -1119,9 +1129,12 @@ def main():
                     "level": ab.get("author_level"),
                     "main_cate": at.get("main_cate") or [],
                     "content_type": [x.get("reason") for x in al if x.get("reason")],
-                    # 筛选用：结算总额（原为视频结算总额）
+                    # 总额（保留：Excel/调试用，不是当前筛选口径）
                     "sale_low": (sinfo.get("total_sales_settle") or {}).get("sale_low"),
                     "sale_high": (sinfo.get("total_sales_settle") or {}).get("sale_high"),
+                    # 当前筛选用：直播结算总额（2026-09-16 起）
+                    "live_low": (sinfo.get("live_total_sales_settle") or {}).get("sale_low"),
+                    "live_high": (sinfo.get("live_total_sales_settle") or {}).get("sale_high"),
                     # Excel 用：四个结算区间
                     "settle_total": rng("total_sales_settle"),            # 销售总额
                     "settle_live": rng("live_total_sales_settle"),         # 直播结算总额
@@ -1142,16 +1155,17 @@ def main():
                     return False
 
             def bad_settle(r):
+                # 当前口径：直播结算总额 = 1w-10w（10000 ~ 100000）
                 try:
-                    return int(r["sale_low"]) < 10000 or int(r["sale_high"]) > 100000
+                    return int(r["live_low"]) < 10000 or int(r["live_high"]) > 100000
                 except Exception:
                     return False
             nf = sum(1 for r in rows if bad_fans(r))
             ns = sum(1 for r in rows if bad_settle(r))
-            log("  校验：粉丝超10w %d 个 / 结算总额不在1w-10w %d 个" % (nf, ns))
+            log("  校验：粉丝超10w %d 个 / 直播结算总额不在1w-10w %d 个" % (nf, ns))
             for r in rows[:8]:
-                log("     %-20s fans=%-8s video=%s-%s gender=%s city=%s" % (
-                    (r["nickname"] or "")[:18], r["fans"], r["sale_low"], r["sale_high"],
+                log("     %-20s fans=%-8s live=%s-%s gender=%s city=%s" % (
+                    (r["nickname"] or "")[:18], r["fans"], r["live_low"], r["live_high"],
                     r["gender"], r["city"]))
 
         # ---------- 本地过滤 ----------
