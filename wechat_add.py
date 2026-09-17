@@ -552,6 +552,8 @@ def run(limit=0, dry=False):
     left = [d for d in cand if (merged.get(d.get("uid")) or {}).get("add_status")
             not in DONE_STATUS]
     log("累计台账 %d 条；剩余待加 %d 个" % (len(merged), len(left)))
+    # 固定收尾提醒（用户 2026-09-17 定：跑完 B 必须把信息登记到飞书）
+    log("👉 收尾：请跑 feishu_sync.py 把本轮结果登记到飞书多维表格（更新「状态」列）")
 
 
 def status():

@@ -189,6 +189,8 @@ def main():
     import darens_io
     darens_io.write_outputs(merged, OUT, "", log=log)
     log("已写出合并名单（正式文件，无 tag 后缀）")
+    # 固定收尾提醒（用户 2026-09-17 定：跑完 A 必须把信息登记到飞书）
+    log("👉 收尾：请跑 feishu_sync.py 把本批达人登记到飞书多维表格")
     log("结束")
 
 
