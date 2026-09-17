@@ -65,6 +65,9 @@
                    -> 跳过（用户 2026-09-17 追加）
       ⚠️ 到手价格式实测为 "￥59.90" / "￥29.90 ￥69.90"（第一个数才是到手价）
       ⚠️ 价格可解析比例 < PRICE_MIN_PARSE（默认 80%）= **未判定 -> 也跳过**
+      3e 养发占比：**商品名 或 店铺名**含 YANGFA_KW（默认「养发」）的件数
+                   **> YANGFA_RATIO（默认 50%，严格大于）** -> 跳过（用户 2026-09-17 追加）
+                   与 3b 的区别：3b 是「任一命中就跳」，3e 要「过半」才跳
       ⚠️ tab 点不到 / 商品数据拿不到 = **未判定 -> 直接跳过该达人**，
          绝不"未判定就进入查微信"（用户 2026-09-15 明确要求的纠错）
       ⚠️ 商品表是分页的（首页约 15 行），3a/3c/3d 都是基于首页样本判定
@@ -548,19 +551,53 @@ SHOP_ROWS_JS = """() => {
 # 坑A：若鼠标停在顶部筛选栏，page.mouse.wheel 完全无效（滚的是外层窗口）——
 #      这就是"有时翻 17 屏拿到 246 个，有时翻 70 屏只拿到 7 个"的原因。
 # 坑B：只按"gap 最大"挑容器会误选到小面板（曾选到 276px 高的元素）→ 必须优先 table-body。
+# 坑C（2026-09-17 15:19 踩到，整轮采集空转报废）：
+#      当天 A 阶段：登录态正常、四项筛选接口校验全过，但容器连续 20 次 + 滚动 20 屏
+#      都判「容器始终未出现」，而这期间截图 out/collect/nocontainer_ghq.png 里
+#      **达人列表明明已经渲染出来了**（有数据、有行、有滚动条）。
+#      同一天用探针 `.probe/probe_scroller_dump.py` 连测 3 次，容器都**正常选得到**
+#      （div.auxo-table-body ch=1135 sh≈1860 gap≈730 ovY=scroll @(565,614)）。
+#      ⚠️ **根因未完全定位**：最后一次「复现 null」是探针自身的 bug
+#      （把已是 `() => {...}` 的 LIST_SCROLLER_JS 又包了一层，evaluate 返回函数 →
+#        序列化不了 → 假 null），不是线上代码的问题。所以**不能断言**就是 gap<=50 卡掉的。
+#      仍保留「按类名认得出的容器放宽 gap 限制」这条改动：
+#      它是**纯放宽**，只会让判定更早成功、不会选错（table-body/virtual-list 是确定的容器），
+#      作为对这类间歇性失败的钝化处理。若再遇到，看下面 DUMP_OVERFLOW_JS 打出的
+#      「溢出候选」清单即可一眼分辨「真没渲染」还是「条件卡太严」。
 # 对策：优先 table-body（打分加权）；每轮把鼠标移到容器中心 + JS 推进 scrollTop 双保险。
 _PICK_SCROLLER = """
     let best = null, bestScore = -1;
     document.querySelectorAll('*').forEach(e => {
+        if (e.clientHeight < 120) return;
         const gap = e.scrollHeight - e.clientHeight;
-        if (gap <= 50 || e.clientHeight < 120) return;
         const cls = (e.className || '').toString();
-        let score = gap;
-        if (cls.indexOf('table-body') >= 0) score += 1000000;
+        const isTB = cls.indexOf('table-body') >= 0;
+        const isVL = cls.indexOf('virtual-list') >= 0;
+        // 常规容器必须真有溢出；按类名认得出的容器放宽（见上方「坑C」）
+        if (gap <= 50 && !isTB && !isVL) return;
+        let score = gap > 0 ? gap : 0;
+        if (isTB) score += 1000000;
+        else if (isVL) score += 500000;
         if (score > bestScore) { bestScore = score; best = e; }
     });
     if (!best) return null;
 """
+
+# 容器死活找不到时的取证：把页面上「有溢出的元素」前几名 dump 出来，
+# 下次一眼就能看出是「没有溢出元素」（真没渲染）还是「条件卡太严」（渲染了但被判掉）。
+DUMP_OVERFLOW_JS = """() => {
+    const out = [];
+    document.querySelectorAll('*').forEach(e => {
+        const gap = e.scrollHeight - e.clientHeight;
+        if (gap <= 0) return;
+        const r = e.getBoundingClientRect();
+        out.push({tag: e.tagName, cls: (e.className || '').toString().slice(0, 48),
+                  gap: gap, ch: e.clientHeight, sh: e.scrollHeight,
+                  h: Math.round(r.height)});
+    });
+    out.sort((a, b) => b.gap - a.gap);
+    return out.slice(0, 6);
+}"""
 
 LIST_SCROLLER_JS = "() => {" + _PICK_SCROLLER + """
     const r = best.getBoundingClientRect();
@@ -596,6 +633,17 @@ CHEAP_RATIO = float(os.environ.get("CHEAP_RATIO", "0.90"))
 #   实测到手价单元格形如 "￥59.90" / "￥29.90 ￥69.90"（**第一个数才是到手价**，
 #   后面那个是划线原价），空值/异常给 "-"。
 PRICE_MIN_PARSE = float(os.environ.get("PRICE_MIN_PARSE", "0.80"))
+
+# 【规则3e】带货**商品名或店铺名**含 YANGFA_KW，且占比 **> YANGFA_RATIO** -> 跳过
+#   用户原话（2026-09-17）：「达人所带货商品及商品店铺带养发，且占比超过50%的，也进行剔除」
+#   · 两条命中路径：商品标题含「养发」 **或** 商品所属店铺名含「养发」
+#   · 「超过 50%」按**严格大于**实现（8/15=53.3% 命中；7/15=46.7%、8/16=50.0% 都不算）
+#   · 分母 = 抓到的商品行数（和 3a/3c/3d 同一份首页样本，约 15 行，已知会低估）
+#   · 与 3b 的区别：3b 是**任一命中就跳**，本条要**过半**才跳
+YANGFA_KW = tuple(
+    x.strip() for x in os.environ.get("YANGFA_KW", "养发").split(",") if x.strip()
+)
+YANGFA_RATIO = float(os.environ.get("YANGFA_RATIO", "0.50"))
 
 
 def _common_prefix(a, b):
@@ -775,11 +823,38 @@ def shopcnt_verdict(shops):
     return len(uniq) <= MIN_SHOP_CNT, len(uniq), uniq
 
 
+def yangfa_verdict(prows):
+    """【规则3e】商品名或店铺名含 YANGFA_KW 的行数占比 > YANGFA_RATIO -> 跳过。
+
+    返回 (是否跳过, 命中占比, 命中件数, 总件数, 样例商品名)
+    第 5 项是给日志/排查用的：列出 1~2 个命中的商品或店铺，方便人工复核。
+    "占比超过 50%" 取**严格大于**（等于 50% 不跳）。
+    """
+    rows = prows or []
+    n_all = len(rows)
+    if not n_all:
+        return False, 0.0, 0, 0, ""
+    hits, sample = 0, ""
+    for x in rows:
+        title = (x.get("title") or "")
+        shop = (x.get("shop") or "")
+        if any(kw in title or kw in shop for kw in YANGFA_KW):
+            hits += 1
+            if not sample:
+                sample = (title or shop).strip()[:28]
+    ratio = hits / float(n_all)
+    return ratio > YANGFA_RATIO, ratio, hits, n_all, sample
+
+
 def nick_exclude_hit(nick):
-    """昵称是否该排除；命中则返回原因（词/号/牌:xxx），否则 None。"""
+    """昵称是否该排除；命中则返回原因（数字/词/号/牌:xxx），否则 None。"""
     n = norm_name(nick)
     if not n:
         return None
+    # 【规则7c】纯数字昵称（用户 2026-09-17 追加：「名字是一堆阿拉伯数字的」
+    #   如「86567278365」）-> 无辨识度，直接排除。判定在 nick_rules.py 里统一维护。
+    if nick_rules.is_digit_nick(nick):
+        return "纯数字"
     for kw in NICK_EXCLUDE_KW:          # 规则7：渠道/供应链特征词
         if norm_name(kw) in n:
             return "词:" + kw
@@ -1370,6 +1445,14 @@ def main():
                 log("  ! 已截图 out/collect/nocontainer%s.png" % OUT_TAG)
             except Exception:
                 pass
+            # 取证：列出页面上有溢出的元素 —— 一眼分辨「真没渲染」vs「条件卡太严」
+            try:
+                for _h in (page.evaluate(DUMP_OVERFLOW_JS) or [])[:6]:
+                    log("    · 溢出候选 gap=%-7d ch=%-6d sh=%-7d h=%-5d %s%s" % (
+                        _h["gap"], _h["ch"], _h["sh"], _h["h"], _h["tag"],
+                        ("." + _h["cls"]) if _h["cls"] else ""))
+            except Exception:
+                pass
         if sc:
             log("  列表滚动容器: %s（高 %d / 内容 %d）@(%d,%d)" % (
                 (sc["cls"] or "")[:40], sc["ch"], sc["sh"], sc["cx"], sc["cy"]))
@@ -1382,6 +1465,8 @@ def main():
             log("  ! 一直没等到滚动容器（继续尝试滚动，容器出现后会自动生效）")
         last_n, stall = -1, 0
         STALL_LIMIT = 5
+        # 护栏：容器一直找不到时别空转满 MAX_SCROLL 屏（2026-09-17 实测空转 50 屏、约 2 分钟）
+        no_cont, NO_CONT_LIMIT = 0, 12
         for s in range(MAX_SCROLL):
             info = None
             try:
@@ -1393,9 +1478,16 @@ def main():
             except Exception:
                 pass
             if info is None:
-                log("  滚动第 %d 屏：容器还没出现，等待中…" % (s + 1))
+                no_cont += 1
+                log("  滚动第 %d 屏：容器还没出现，等待中…（%d/%d）"
+                    % (s + 1, no_cont, NO_CONT_LIMIT))
+                if no_cont >= NO_CONT_LIMIT:
+                    log("  !! 连续 %d 屏都定位不到滚动容器 -> 放弃本批翻页"
+                        "（多半是表格没渲染出来；看上面「溢出候选」和截图判断）")
+                    break
                 time.sleep(2.5)
                 continue                                        # 不计入 stall
+            no_cont = 0
             time.sleep(SCROLL_PAUSE)
             got = sum(len((d.get("data") or {}).get("list") or []) for d in apis)
             stall = stall + 1 if got == last_n else 0
@@ -1696,6 +1788,21 @@ def main():
                                 verdict_cache[r["uid"]] = "skip"
                                 log("   [%d/%d] %-20s 带货商品含「%s」-> 跳过该达人" % (
                                     i, cand_n, nick18, bad_kw))
+                                break
+                            # 规则3e：商品名 **或** 店铺名含「养发」，且占比 > 50% -> 跳过
+                            yskip, yratio, yhits, yall, ysample = yangfa_verdict(prows)
+                            if yskip:
+                                r["shop_rows"] = len(prows)
+                                r["titles"] = [t for t in titles if t][:12]
+                                r["yangfa_ratio"] = round(yratio, 3)
+                                r["skip_reason"] = "带货含养发%.0f%%(%d/%d)" % (
+                                    yratio * 100, yhits, yall)
+                                verdict_cache[r["uid"]] = "skip"
+                                log("   [%d/%d] %-20s 商品/店铺含「%s」%d/%d 件占 %.0f%%"
+                                    " (>%.0f%%) -> 跳过该达人%s" % (
+                                        i, cand_n, nick18, "/".join(YANGFA_KW),
+                                        yhits, yall, yratio * 100, YANGFA_RATIO * 100,
+                                        ("：" + ysample) if ysample else ""))
                                 break
                             shops = [x.get("shop") for x in prows
                                      if (x.get("shop") or "").strip()]

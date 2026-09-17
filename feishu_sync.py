@@ -218,7 +218,7 @@ def build_rows(recs, ledger, all_rec, limit, keep_excluded=False):
         name = (r.get("nickname") or "").strip()
         if not name:
             continue
-        if not keep_excluded and nick_rules.nick_exclude_kw_hit(name):
+        if not keep_excluded and nick_rules.nick_exclude_reason(name):
             stat["昵称排除"] += 1
             continue
         st = (ledger.get(r.get("uid")) or {}).get("add_status") or ""

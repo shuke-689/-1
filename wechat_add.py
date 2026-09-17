@@ -444,12 +444,14 @@ def _drop_nick_excluded(cand):
         而 `darens.json` 是上一次 A 阶段跑出来的**旧名单**，不会自动重筛；
       · B 阶段的好友申请**发出去就撤不回**，所以宁可在这一步多挡一道。
     词表实体在 `nick_rules.py`（纯数据+纯函数），A/B/C 三个阶段共用同一份。
+    走的是 `nick_rules.nick_exclude_reason()` —— 它包含**排除词 + 纯数字昵称**两个维度；
+    别单独调 `nick_exclude_kw_hit()`，否则新维度会漏掉 B 阶段。
     """
     keep, out = [], []
     for d in cand:
-        hit = nick_rules.nick_exclude_kw_hit(d.get("nickname") or "")
-        if hit:
-            out.append((d.get("nickname") or "", hit))
+        why = nick_rules.nick_exclude_reason(d.get("nickname") or "")
+        if why:
+            out.append((d.get("nickname") or "", why))
         else:
             keep.append(d)
     return keep, out

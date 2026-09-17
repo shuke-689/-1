@@ -44,3 +44,34 @@ def nick_exclude_kw_hit(nick):
     if not n:
         return ""
     return next((kw for kw in NICK_EXCLUDE_KW if norm_name(kw) in n), "")
+
+
+# ---------------------------------------------------------------------------
+# 【规则7c】昵称是「一堆阿拉伯数字」-> 排除（用户 2026-09-17 追加）
+#   典型样本：「86567278365」这种号（实测是随手起的名 / 手机号 / 随机串），
+#   完全没有品牌辨识度，属无意义号。
+#   判定：**归一化后整串都是数字**，且长度 >= DIGIT_NICK_MIN。
+#   ⚠️ 刻意**只认「纯数字」**，不认「含数字」：
+#      「小美123」「一米六的安安」这类不该被误伤（用户原话是「名字是一堆阿拉伯数字」）。
+#      若以后要放宽成「数字占比很高」，调这里而不是在调用点各写一遍。
+DIGIT_NICK_MIN = int(os.environ.get("DIGIT_NICK_MIN", "4"))
+
+
+def is_digit_nick(nick, min_len=None):
+    """昵称归一化后是否**全是阿拉伯数字**（且够长）。"""
+    n = norm_name(nick)
+    return len(n) >= (min_len if min_len else DIGIT_NICK_MIN) and n.isdigit()
+
+
+def nick_exclude_reason(nick):
+    """规则7 统一入口：返回排除原因（'词:xxx' / '纯数字'），不该排除返回 ''。
+
+    ⚠️ 阶段 A / B / C **都用这个**，别再各自调 nick_exclude_kw_hit ——
+    否则加了新维度（如纯数字）会漏掉某一阶段。
+    """
+    hit = nick_exclude_kw_hit(nick)
+    if hit:
+        return "词:" + hit
+    if is_digit_nick(nick):
+        return "纯数字"
+    return ""

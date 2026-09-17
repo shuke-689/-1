@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
-"""规则单测（2026-09-17 新增三条带货规则）：
+"""规则单测（2026-09-17 新增带货规则 + 昵称排除词）：
   3b 禁忌商品关键词（含 充电宝 / 3C数码 等）
   3c 去重店铺家数 <= MIN_SHOP_CNT -> 跳过
   3d >= 90% 商品到手价 < 30 元 -> 跳过（价格以探针实测的单元格格式为准）
+  3e 商品名/店铺名含「养发」且占比 > 50% -> 跳过
+  规则7 昵称排除词（国际/香港/假发/…/睫毛/香水/源头）
+  规则7c 纯数字昵称（如 86567278365）-> 跳过
 
 跑法：
   set PYTHONPATH=<proj>\\.probe\\libs
@@ -14,7 +17,8 @@ import sys
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE)
 
-import collect as C  # noqa: E402
+import collect as C        # noqa: E402
+import nick_rules as NR    # noqa: E402
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -95,6 +99,45 @@ CHEAP_CASES = [
     (rows(["￥9.90"] * 10 + ["-", "", "-", "暂无", "-"]), False, "fewprice"),
 ]
 
+# ---------------- 3e 养发占比（商品名 或 店铺名 含「养发」，占比 > 50%） ----------------
+def yrows(titles=None, shops=None, n=None):
+    """构造 prows；titles/shops 给几个就有几行（不足 n 的用中性值补齐）。"""
+    titles = titles or []
+    shops = shops or []
+    n = n if n is not None else max(len(titles), len(shops))
+    out = []
+    for i in range(n):
+        out.append({"title": titles[i] if i < len(titles) else "普通洗发水",
+                    "shop": shops[i] if i < len(shops) else "某某日化店",
+                    "price": "￥59.90"})
+    return out
+
+
+YANGFA_CASES = [
+    # 15 件里 8 件商品名含「养发」(53.3% > 50%) -> 跳过
+    (yrows(titles=["养发精华"] * 8, n=15), True, 8, 15),
+    # 15 件里 7 件含「养发」(46.7% <= 50%) -> 不跳过
+    (yrows(titles=["养发精华"] * 7, n=15), False, 7, 15),
+    # 16 件里 8 件 (恰好 50.0%，**不**算「超过」) -> 不跳过
+    (yrows(titles=["养发精华"] * 8, n=16), False, 8, 16),
+    # 商品名都没提，但**店铺名**含「养发」8/15 -> 跳过（用户明确要求算上店铺）
+    (yrows(shops=["XX养发馆"] * 8, n=15), True, 8, 15),
+    # 商品 3 件 + 店铺 6 件，合计 9/15 = 60% -> 跳过（两条路径**并集**计数）
+    (yrows(titles=["养发液"] * 3 + [""] * 6,
+           shops=[""] * 3 + ["养发世家"] * 6, n=15), True, 9, 15),
+    # 全是无关商品 -> 不跳过
+    (yrows(titles=["洗发水", "护发素", "沐浴露"], n=3), False, 0, 3),
+    # 没有商品行 -> 不跳过（分母为 0，不能判成命中）
+    ([], False, 0, 0),
+    # 「养发」出现在店铺名但只有 5/15 (33%) -> 不跳过
+    (yrows(shops=["养发馆"] * 5, n=15), False, 5, 15),
+]
+
+# ---------------- 规则7c 纯数字昵称 ----------------
+DIGIT_HIT = ["86567278365", "1787097519", "920302", "0012345"]
+DIGIT_MISS = ["一米六的安安", "盈妹", "小美123", "3CE口红", "小宇的零食铺2",
+              "123", "abc12345"]      # 长度不足 4 / 含字母 -> 都不算「纯数字」
+
 
 def main():
     bad = 0
@@ -174,6 +217,33 @@ def main():
             bad += 1
         print("  %s %d 件(可解析 %d) 占比 %.1f%% -> skip=%-5s why=%-9s (期望 skip=%s why=%s)" % (
             "OK " if ok else "!! ", n_all, n_ok, ratio * 100, skip, why, exp_skip, exp_why))
+
+    print("=" * 60)
+    print("3e 养发占比（商品名 或 店铺名 含 %s，占比 > %.0f%%）" % (
+        "/".join(C.YANGFA_KW), C.YANGFA_RATIO * 100))
+    for prows, exp_skip, exp_hits, exp_all in YANGFA_CASES:
+        skip, ratio, hits, n_all, sample = C.yangfa_verdict(prows)
+        ok = (skip == exp_skip and hits == exp_hits and n_all == exp_all)
+        if not ok:
+            bad += 1
+        print("  %s 命中 %d/%d (%.1f%%) -> skip=%-5s (期望 skip=%s 命中=%d/%d) %s" % (
+            "OK " if ok else "!! ", hits, n_all, ratio * 100, skip,
+            exp_skip, exp_hits, exp_all, ("例:" + sample) if sample else ""))
+
+    print("=" * 60)
+    print("规则7c 纯数字昵称（DIGIT_NICK_MIN=%d）" % NR.DIGIT_NICK_MIN)
+    for t in DIGIT_HIT:
+        got = C.nick_exclude_hit(t)
+        ok = got == "纯数字"
+        if not ok:
+            bad += 1
+        print("  %s 应排除 -> 实际 %-12r %s" % ("OK " if ok else "!! ", got, t))
+    for t in DIGIT_MISS:
+        got = C.nick_exclude_hit(t)
+        ok = got is None
+        if not ok:
+            bad += 1
+        print("  %s 应保留 -> 实际 %-12r %s" % ("OK " if ok else "!! ", got, t))
 
     print("=" * 60)
     if bad:
