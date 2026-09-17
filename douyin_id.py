@@ -116,21 +116,31 @@ POPUP_PROBE_JS = """() => {
 
 # 找弹窗右上角的关闭按钮。
 #
-# ⚠️ 2026-09-17 教训：抖音是 CSS-Modules，class 名是**哈希串**（`J8iVz0S9`），
-#    所以 `[class*="close"]` 必然一个都匹配不到 —— 日志里「点 X: …」那行从来没出现过，
-#    直接跳到「⚠️ 弹窗没关掉」。旧实现（label / class / ✕文本 三路）在抖音上全军覆没。
+# ⚠️ 2026-09-17 两轮教训：
+#   ① 抖音是 CSS-Modules，class 名是**哈希串**（`J8iVz0S9`）→ `[class*="close"]` 白搭；
+#      「aria-label/title 含关闭 / class 含 close / 文本是 ✕」三路在抖音上*全军覆没*
+#      （日志里「点 X: tag=…」那行从来没出现过，直接跳到「⚠️ 弹窗没关掉」）。
+#   ② 换成「按定位找弹窗容器（fixed/absolute）」后仍然失败，**取证 dump 直接给出真因**：
+#      `{"vw":2552,"vh":1308,"root":null,"note":"未找到 fixed/absolute 弹窗容器…"}`
+#      → 文案确实在页面正文里（不是 iframe），但**没有任何 fixed/absolute 容器装着它**：
+#        真实结构是「全屏遮罩(fixed, 被 92% 规则排除) + 卡片(position 不是 fixed/absolute)」。
+#        所以「**不能**先按定位找容器」。
 #
-# 现行算法 = **几何法**，完全不依赖 class 名：
-#   1) 找出所有「包含弹窗文案 + fixed/absolute 定位 + 面积 <92% 视口」的容器；
-#      面积 >92% 视口的是背后的半透明遮罩，必须排除，否则「右上角」就变成页面右上角。
-#      再按面积**升序**取最紧的 8 个（真正贴着弹窗的容器排前面，冗余的外层 wrapper 排后面）；
-#   2) 对每个容器分别扫描其内部小元素（8~90 px），以**该容器自己的右上角**为基准算距离，
-#      合并打分（越贴角分越低）。多个容器一起算 -> 外面套一层大 wrapper 也不会把 ✕ 挤出去；
-#      带 close|关闭|dismiss|cancel 关键字的直接降 1000 分优先；
-#   3) 兜底给「最紧那个容器右上角内侧」的猜测点（pri 90000，最后才试）。
-FIND_CLOSE_JS = """() => {
+# 现行算法 = **文案锚点 + 祖先链 + 几何打分**（不看 class、不看 position）：
+#   1) 找**最内层**含弹窗文案的元素（`textContent` 最短者）作为锚点；
+#   2) 从锚点沿 `parentElement` 上溯，把每一层「面积 ≥120×100 且 <92% 视口」的容器都收作
+#      候选容器，**遇到 ≥92% 视口的就停**（再往上就是全屏遮罩）。
+#      → 卡片必然在链上被收到，无需关心它是 static 还是 relative。
+#   3) 另收一拨「fixed/absolute 且含文案」的容器（有些弹窗确实是这种结构）+ 兜底。
+#      候选容器按**面积升序**，每个容器**各自以自己的右上角**为基准扫描 8~90px 小元素并打分，
+#      合并排序 → 就算外面还套一层大 wrapper，贴得最紧的那个容器也会让真 ✕ 胜出。
+#   4) 打分优先级：卡片内带 close|关闭|dismiss|cancel|✕|× 语义的（0 分）→
+#      几何上最贴容器右上角的（1000+dx+dy）→ 全局带「关闭」语义的（1500，可能点到别的弹窗）→
+#      「最紧容器右上角内侧 32×32」的猜测点（90000，调用方前几轮会跳过它）。
+#
+# 下面这段是 find / dump 共用的 JS（已 % 填好 KW），拼进两个 evaluate 负载里。
+_POPUP_COMMON_JS = """
     const KW = %s;
-    const out = [];
     const rect = (e) => { try { return e.getBoundingClientRect(); } catch (err) { return null; } };
     const vis = (e) => {
         const st = getComputedStyle(e);
@@ -139,28 +149,66 @@ FIND_CLOSE_JS = """() => {
         return true;
     };
     const VW = innerWidth, VH = innerHeight;
+    const desc = (e, r) => ({
+        tag: e.tagName,
+        cls: (typeof e.className === 'string' ? e.className : '').slice(0, 48),
+        pos: (() => { try { return getComputedStyle(e).position; } catch (err) { return '?'; } })(),
+        label: (e.getAttribute('aria-label') || '').slice(0, 16),
+        e2e: (e.getAttribute('data-e2e') || '').slice(0, 20),
+        xy: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+        txt: (e.innerText || '').trim().slice(0, 14)
+    });
 
-    // ---- 1) 所有合格的弹窗容器，按面积升序 ----
-    const roots = [];
-    document.querySelectorAll('div,section,article,aside,form').forEach(e => {
-        const t = e.innerText || '';
-        if (!t) return;
-        if (!KW.some(k => t.indexOf(k) >= 0)) return;
+    const roots = [], seenBox = new Set();
+    const addRoot = (e, why) => {
         const r = rect(e); if (!r) return;
+        if (r.width >= VW * 0.92 || r.height >= VH * 0.92) return;   // 全屏遮罩，排除
         if (r.width < 120 || r.height < 100) return;
-        if (r.width > VW * 0.92 || r.height > VH * 0.92) return;   // 铺满=遮罩，排除
+        const k = [Math.round(r.x), Math.round(r.y), Math.round(r.width),
+                   Math.round(r.height)].join(',');
+        if (seenBox.has(k)) return;
+        seenBox.add(k);
+        roots.push({el: e, r: r, area: r.width * r.height, why: why});
+    };
+
+    // A) 文案锚点（textContent 便宜，不用 innerText 免得为每个元素触发排版）
+    let anchor = null, alen = 1e9;
+    document.querySelectorAll('*').forEach(e => {
+        const t = e.textContent || '';
+        if (!t || t.length >= alen || t.length > 3000) return;
+        if (!KW.some(k => t.indexOf(k) >= 0)) return;
+        alen = t.length; anchor = e;
+    });
+    if (anchor) {
+        let node = anchor, hops = 0;
+        while (node && hops < 16) {
+            const r = rect(node);
+            if (r && (r.width >= VW * 0.92 || r.height >= VH * 0.92)) break;  // 再往上=遮罩
+            addRoot(node, 'anchor');
+            node = node.parentElement; hops++;
+        }
+    }
+
+    // B) fixed/absolute 且含文案的容器
+    document.querySelectorAll('div,section,article,aside,form').forEach(e => {
+        const t = e.textContent || '';
+        if (!t || !KW.some(k => t.indexOf(k) >= 0)) return;
         const st = getComputedStyle(e);
         if (st.position !== 'fixed' && st.position !== 'absolute') return;
-        roots.push({el: e, r: r, area: r.width * r.height});
+        addRoot(e, 'posfixed');
     });
-    if (!roots.length) return out;
-    roots.sort((a, b) => a.area - b.area);
-    const picked = roots.slice(0, 8);
 
-    // ---- 2) 每个容器各自求「右上角邻居」 ----
+    roots.sort((a, b) => a.area - b.area);
+    const picked = roots.slice(0, 6);
+""" % (json.dumps(list(POPUP_TEXT_KW), ensure_ascii=False),)
+
+FIND_CLOSE_JS = "() => {" + _POPUP_COMMON_JS + """
+    const out = [];
+    if (!picked.length) return out;
     const seenEl = new Set();
+
+    // 每个候选容器各自求「右上角邻居」
     picked.forEach(R => {
-        // 窗口随容器尺寸放宽（大 wrapper 的角离 ✕ 可能远一些）
         const ww = Math.max(100, Math.min(240, R.r.width * 0.3));
         const wh = Math.max(100, Math.min(240, R.r.height * 0.3));
         R.el.querySelectorAll('*').forEach(e => {
@@ -192,7 +240,21 @@ FIND_CLOSE_JS = """() => {
         });
     });
 
-    // ---- 3) 兜底猜测点：最紧容器的右上角内侧 32x32 ----
+    // 全局带「关闭」语义的小元素：只在卡片内找不到时才有意义，所以排到 corner 之后
+    document.querySelectorAll('[aria-label*="关闭"],[aria-label*="close"],[title*="关闭"],' +
+                              '[data-e2e*="close"],[data-e2e*="关闭"]').forEach(e => {
+        const r = rect(e); if (!r) return;
+        if (r.width < 8 || r.height < 8 || r.width > 90 || r.height > 90) return;
+        if (!vis(e)) return;
+        const k = 'g' + Math.round(r.x) + ',' + Math.round(r.y) + ',' + r.width + ',' + r.height;
+        if (seenEl.has(k)) return;
+        seenEl.add(k);
+        out.push({x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width),
+                  h: Math.round(r.height), why: 'label-global', pri: 1500,
+                  tag: e.tagName, txt: ''});
+    });
+
+    // 兜底猜测点：最紧容器右上角内侧 32x32
     const T = picked[0].r;
     const gx = Math.round(T.right - 34), gy = Math.round(T.top + 2);
     if (gx > 0 && gy > 0 && gx < VW && gy < VH) {
@@ -202,54 +264,40 @@ FIND_CLOSE_JS = """() => {
 
     out.sort((a, b) => a.pri - b.pri);
     return out.slice(0, 10);
-}""" % (json.dumps(list(POPUP_TEXT_KW), ensure_ascii=False),)
+}"""
 
-# 找不到关闭按钮时的取证 dump：把弹窗根 + 右上角区域元素的结构打印出来，
-# 供下次定位失败时**从日志直接看出来**该怎么点（不用再单开探针，profile 被占用也测不了）。
-POPUP_DUMP_JS = """() => {
-    const KW = %s;
-    const rect = (e) => { try { return e.getBoundingClientRect(); } catch (err) { return null; } };
-    const desc = (e, r) => ({
-        tag: e.tagName,
-        cls: (typeof e.className === 'string' ? e.className : '').slice(0, 60),
-        label: (e.getAttribute('aria-label') || '').slice(0, 20),
-        title: (e.getAttribute('title') || '').slice(0, 20),
-        e2e: (e.getAttribute('data-e2e') || '').slice(0, 24),
-        xy: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
-        txt: (e.innerText || '').trim().slice(0, 16)
-    });
-    const roots = [];
-    document.querySelectorAll('div,section,article,aside,form').forEach(e => {
-        const t = e.innerText || '';
-        if (!t || !KW.some(k => t.indexOf(k) >= 0)) return;
-        const r = rect(e); if (!r) return;
-        if (r.width < 120 || r.height < 100) return;
-        if (r.width > innerWidth * 0.92 || r.height > innerHeight * 0.92) return;
-        const st = getComputedStyle(e);
-        if (st.position !== 'fixed' && st.position !== 'absolute') return;
-        roots.push({el: e, r: r, area: r.width * r.height});
-    });
-    if (!roots.length) return {vw: innerWidth, vh: innerHeight, root: null,
-                       note: '未找到 fixed/absolute 弹窗容器（文案可能来自页面正文，非弹窗）'};
-    roots.sort((a, b) => a.area - b.area);
-    const T = roots[0];
+# 找不到关闭按钮时的取证 dump：把「锚点 / 祖先链 / 候选容器 / 右上角邻居」全打进日志，
+# 供下次定位失败时**从日志直接看出来**该怎么点
+# （跑 A/B 时 Edge profile 被占用，另开探针起不来，所以必须靠日志取证）。
+POPUP_DUMP_JS = "() => {" + _POPUP_COMMON_JS + """
+    let chain = [];
+    if (anchor) {
+        let node = anchor, hops = 0;
+        while (node && hops < 10) {
+            const r = rect(node);
+            if (r) chain.push(desc(node, r));
+            node = node.parentElement; hops++;
+        }
+    }
     const near = [];
-    roots.slice(0, 4).forEach(R => {
+    picked.forEach(R => {
         R.el.querySelectorAll('*').forEach(el => {
             const r = rect(el); if (!r) return;
             if (r.width < 6 || r.height < 6 || r.width > 120 || r.height > 120) return;
             const dx = R.r.right - r.right, dy = r.top - R.r.top;
             if (dx < -6 || dy < -6 || dx > 160 || dy > 160) return;
             const d = desc(el, r);
-            d.root = [Math.round(R.r.x), Math.round(R.r.y), Math.round(R.r.width), Math.round(R.r.height)];
+            d.root = [Math.round(R.r.x), Math.round(R.r.y),
+                      Math.round(R.r.width), Math.round(R.r.height)];
             near.push(d);
         });
     });
     near.sort((a, b) => (a.xy[0] + a.xy[1]) - (b.xy[0] + b.xy[1]));
-    return {vw: innerWidth, vh: innerHeight,
-            roots: roots.slice(0, 4).map(R => desc(R.el, R.r)),
-            root: desc(T.el, T.r), near: near.slice(0, 14)};
-}""" % (json.dumps(list(POPUP_TEXT_KW), ensure_ascii=False),)
+    return {vw: VW, vh: VH,
+            anchor: anchor ? desc(anchor, rect(anchor)) : null,
+            chain: chain.slice(0, 6), roots: picked.map(R => desc(R.el, R.r)),
+            near: near.slice(0, 8)};
+}"""
 
 
 def popup_present(page):
@@ -284,11 +332,12 @@ def dismiss_popup(page, log=None, wait_s=4.0, settle_s=0.5, rounds=3):
         except Exception as e:
             _log(log, "找关闭按钮失败: %s" % str(e)[:60])
             cands = []
-        if not cands:
-            # 取证：把弹窗结构打进日志，下次就知道该点哪儿了
+        if not cands and r == 0:
+            # 取证：把「锚点 / 祖先链 / 候选容器 / 右上角邻居」打进日志，
+            # 下次就知道该点哪儿了。只打第一轮，避免 3 轮刷同样的内容。
             try:
                 d = page.evaluate(POPUP_DUMP_JS) or {}
-                _log(log, "  取证: " + json.dumps(d, ensure_ascii=False)[:700])
+                _log(log, "  取证: " + json.dumps(d, ensure_ascii=False)[:1200])
             except Exception as e:
                 _log(log, "  dump 失败: %s" % str(e)[:60])
         # 逐个试（旧版只点第一个就 break，第一个错了整轮白费）；

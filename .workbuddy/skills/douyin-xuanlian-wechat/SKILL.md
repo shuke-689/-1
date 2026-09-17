@@ -30,6 +30,14 @@ source tools/env.sh        # 自动探测 Python / PYTHONPATH / git，跨机器�
 "$PY" setup_env.py             # 缺就装（默认清华镜像）
 ```
 
+`tools/` 下的小工具（都不需要额外依赖）：
+
+| 脚本 | 用途 |
+|---|---|
+| `tools/env.sh` | `source` 后导出 `$PY/$PYTHONPATH/$GIT`，跨机器可移植 |
+| `tools/run_b_rounds.sh` | 阶段B 连跑（一直加到风控/候选加完），见 §3 |
+| `tools/check_js.py` | 把 .py 里 Playwright 用的 JS 负载抠出来做 `node --check`，见 §7 |
+
 ## 1. 触发词 → 立即动作
 
 | 用户说（大意即可） | 执行 |
@@ -144,15 +152,18 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
    `dismiss_popup()` 点右上角 ✕（靠**文案**判定有弹窗，**不能靠遮罩**
    —— 抖音主页本身就有铺满的容器，按遮罩会到处误点）。关不掉也不阻塞读取。
    该弹窗本来就只挡中间，顶部「昵称+抖音号」一直读得到。
-   ⚠️ **抖音 class 名是哈希串**（`J8iVz0S9`），`[class*="close"]` 永远匹配不到 →
-   关闭按钮定位必须用**几何法**：找「innerText 含弹窗文案 + fixed/absolute +
-   面积 <92% 视口」的容器（按面积升序取最紧的 8 个，**排除全屏遮罩**、
-   **多容器各自求角再合并打分**，以防外面还套一层大 wrapper），
-   在右上角窗口内找 8~90 px 小元素，`aria-label/title/data-e2e/class` 含
-   close|关闭|dismiss|cancel|✕|× 的优先；兜底点最紧容器右上角内侧 32×32。
+   ⚠️ **抖音 class 名是哈希串**（`J8iVz0S9`），`[class*="close"]` 永远匹配不到；
+   **也不要指望按 position 找容器**（实测 dump 出 `root:null`：真实结构是
+   「全屏遮罩 fixed + 卡片 relative/static」）。现行做法 = **文案锚点 + 祖先链 + 几何打分**：
+   取 `textContent` 最短且含弹窗文案的元素当锚点 → 沿 `parentElement` 上溯，
+   收每层「≥120×100 且 <92% 视口」的容器（遇到 ≥92% 就停，那是遮罩）→
+   每个容器**以自己的右上角**为基准扫 8~90px 小元素并合并打分（紧容器天然胜出）→
+   带 `close|关闭|dismiss|✕` 语义的优先 → 兜底点最紧容器右上角内侧 32×32。
    **判据**：日志出现「检测到弹窗」后若**没有**紧跟「点 X: tag=…」明细，
-   就是候选数组为空 = 定位失败；此时会打印 `取证: {...}` dump（视口/容器/右上角邻居），
-   照 dump 就能定位。离线回归：`node out/_jscheck/test_find_close.js`（7 场景）。
+   就是候选数组为空 = 定位失败；此时会打印 `取证: {...}` dump
+   （`anchor`/`chain`/`roots`/`near`），照 dump 就能定位。
+   离线回归：`"$PY" tools/check_js.py douyin_id.py`（语法）+
+   `node out/_jscheck/test_find_close.js`（9 场景行为，不占 profile）。
 
 **达人主页「带货分析」的四条带货规则（2026-09-17 已扩到 3a~3d）**
 
@@ -218,6 +229,18 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
   ⚠️ 但**不要据此长期放量**：我们只观察到「没触发」，**没观察到安全边界在哪**，
   而且风控可能是**延迟或事后**生效的（比如过一会儿才限制）。
   默认节奏照旧；用户要求连跑时先报当天已发次数，由他决定。
+- 🔴 **绝不能与阶段A并行跑**（2026-09-17 发现的具体风险，别再试）：
+  - B 读结果靠 `screenshot_region()` = **桌面区域截图**；B 会 `set_foreground(微信)`，
+    但 A 的 `douyin_id` 每个达人会 `bring_to_front()` 把 Edge 拉到最前 → 两者**拉锯**，
+    B 的截图可能拍到 Edge 而不是微信。
+  - 拍错了会命中**错误分支**：`RISK_KW` 里有 `过于频繁` / `请稍后再试`，
+    而精选联盟的限流文案是「**请求**过于频繁，**请稍后再试**」—— 完全命中 →
+    **误判风控、整轮中止**；`NOT_FOUND_KW` 里有 `请检查` / `不存在` / `找不到` →
+    可能**误判 not_found，而 `not_found` 属于 `DONE_STATUS`，该达人被永久跳过**（数据丢失）。
+  - 结论：**A 跑完（两批都完）再跑 B**。想提前跑就先停 A。
+  - （补充事实：A **不注入 OS 级键鼠**，只用 `win_io.get_clipboard()` 读联系方式；
+    B 用 `SendInput` 打字、**不碰剪贴板** → 剪贴板与真实光标不冲突，冲突只在**前台窗口**。）
+
 - 连跑做法：用 **`tools/run_b_rounds.sh [LIMIT] [MAX_ROUNDS] [GAP_SEC]`**（默认 10 / 30 / 60）。
   它循环跑 `run --limit N`，命中任一条件即停：
   ① `检测到微信风控` → 退出码 2；② `找不到「添加朋友」窗口` → 退出码 3（先开窗口再跑）；
@@ -349,7 +372,7 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 | 抖音号取回来看起来是别人的 | **串号 bug** → 看 RUNBOOK 3.8；日志应有「页面含该达人昵称=True」，为 False 就该怀疑 |
 | 抖音主页弹登录框挡事 | 已内置 `dismiss_popup()` 点 ✕；关不掉也不影响读顶部抖音号 |
 | 日志只有「检测到弹窗→点 X 关闭」紧跟「⚠️ 弹窗没关掉」，中间**没有**「点 X: tag=…」 | 关闭按钮**一个候选都没找到**（抖音 class 是哈希串，`[class*=close]` 无效）→ 已改几何法，见 RUNBOOK 3.8；同时看紧随其后的 `取证: {...}` dump |
-| 想复现/回归弹窗定位逻辑 | `node out/_jscheck/test_find_close.js`（桩 DOM，7 场景，无需浏览器/不占 profile） |
+| 想复现/回归弹窗定位逻辑 | `"$PY" tools/check_js.py douyin_id.py` + `"$NODE" out/_jscheck/test_find_close.js`（桩 DOM，9 场景，无需浏览器/不占 profile） |
 | `status` 报的待加数比实际加的多 | 已修：`status` 现在也过规则7 过滤器；若仍不一致，检查是否用了旧版脚本 |
 
 诊断探针（`.probe/`）：`probe_login.py`、`probe_api.py <类目>`、
@@ -363,6 +386,7 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 "$PY" .probe/test_brand.py      # 带货同品牌占比判定（11 组）
 "$PY" .probe/test_new_rules.py  # 禁忌词 + 店铺家数 + 低价铺货 + 价格解析 + 养发占比(3e) + 纯数字昵称(7c)
 "$PY" -m py_compile douyin_id.py collect.py   # 语法自检
+"$PY" tools/check_js.py douyin_id.py           # Playwright JS 负载的语法自检（见下）
 ```
 
 **改任何规则后必须跑这三个**，全绿才算改完。
@@ -371,21 +395,20 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 
 **Playwright JS 的离线回归（不占浏览器 profile，跑 A/B 时也能测）**
 
-给 `page.evaluate()` 用的 JS 字符串没法单测，也**不能在跑 A/B 时另开探针**
-（Edge profile 被占，第二个实例起不来）。办法是**把 JS 从 .py 里抠出来，用桩 DOM 在 node 里跑**：
+给 `page.evaluate()` 用的 JS 是**字符串**，Python 侧看不出语法错；而跑 A/B 时
+Edge profile 被占用，**起不了第二个探针**。所以把 JS 抠出来在 node 里测：
 
-```python
-# 抠 JS：ast 取赋值右侧，若有 `% json.dumps(...)` 就先把 %s 填掉
-body = node.value.left if isinstance(node.value, ast.BinOp) else node.value
-js = body.value % (json.dumps(KW, ensure_ascii=False),)
-open('out/_jscheck/FIND_CLOSE_JS.js','w',encoding='utf-8').write("const f = " + js + ";\n")
-```
 ```bash
-"$NODE" --check out/_jscheck/FIND_CLOSE_JS.js        # 语法
-"$NODE" out/_jscheck/test_find_close.js              # 桩 DOM 行为（7 场景）
+"$PY" tools/check_js.py douyin_id.py         # AST 抠出 *_JS 常量 -> out/_jscheck/*.js + node --check
+"$NODE" out/_jscheck/test_find_close.js      # 桩 DOM 跑行为（9 场景）
 ```
-桩 DOM 只要实现 `document.querySelectorAll` / `getAttribute` / `getBoundingClientRect`
-/ `querySelectorAll` / `global.getComputedStyle` / `innerWidth·innerHeight` 就够了。
+
+`tools/check_js.py` 能解析的写法：字面量 / `"""...%s""" % (args,)` /
+`"() => {" + _COMMON + "..."` 拼接 / `json.dumps(list(KW), ensure_ascii=False)`。
+`_` 开头的中间片段也没问题（只用于解析，不作为输出）。
+桩 DOM 只需实现 `document.querySelectorAll`（按选择器过滤）/ `getAttribute` /
+`textContent`·`innerText` / `getBoundingClientRect` / `parentElement` /
+`querySelectorAll` / `global.getComputedStyle` / `innerWidth·innerHeight`。
 ⚠️ 写桩测时**别在 JS 里用 `\\\\uXXXX`**：Python 非 raw 字符串里 `"\\u2715"` 到 JS 是
 `'\u2715'`（JS 再解析成 ✕，正确），`"\\\\u2715"` 才是**字面量 6 字符串**（错误）。
 干脆直接写字符 `✕`/`×` 最省事。

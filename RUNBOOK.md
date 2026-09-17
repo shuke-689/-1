@@ -444,6 +444,22 @@ tools/run_b_rounds.sh 10 30 60               # LIMIT / MAX_ROUNDS / 轮间秒数
 
 **启动后立刻提醒用户：8-10 分钟内不要碰鼠标键盘。**
 
+🔴 **前置铁律：阶段B 绝不能与阶段A 并行跑**（2026-09-17 定位到的具体机制）
+
+- B 读结果用 `screenshot_region()` = **桌面区域截图**（不是窗口截图）。B 每次都
+  `set_foreground(微信)`，但 A 的 `douyin_id.fetch()` 每个达人都会 `bring_to_front()`
+  把 Edge 拉到最前 → 两边**拉锯**，B 的截图可能拍到 Edge。
+- 拍到 Edge 会命中**错误分支**，因为关键词表刚好撞上精选联盟的文案：
+  | B 的分支 | 关键词 | 精选联盟的对应文案 | 后果 |
+  |---|---|---|---|
+  | `risk_control` | `过于频繁` / `请稍后再试` | 「**请求**过于频繁，**请稍后再试**」（11001 限流） | 误判风控 → **整轮中止** |
+  | `not_found` | `请检查` / `不存在` / `找不到` | 页面其他提示 | 误判 → 而 `not_found` ∈ `DONE_STATUS` → **达人被永久跳过** |
+  | `unknown` | — | — | 不计入完成，下轮重试（**这个没事**） |
+- 所以：**等 A 的两批都跑完再跑 B**；要提前跑就先停 A。
+- 附带事实（省得再查）：A **不注入 OS 级键鼠**，只 `import win_io` 用 `get_clipboard()`
+  读联系方式；B 用 `SendInput`（`KEYEVENTF_UNICODE`）打字、**不调用** `set_clipboard`
+  → 剪贴板与真实光标**不冲突**，唯一的冲突点是**前台窗口**。
+
 **`tools/run_b_rounds.sh` 连跑脚本**（2026-09-17 新增，固化「一直加到风控为止」的做法）
 
 循环执行 `wechat_add.py run --limit N`，命中任一条件即停：
@@ -647,31 +663,54 @@ DOUYIN_FORCE=1 "$PY" douyin_id.py       # 强制重抓已有的（用于验证�
 `J8iVz0S9` 这种随机串，且不带 aria-label、不含文本。**症状识别**：日志只有
 「检测到弹窗 → 点 X 关闭」紧跟「⚠️ 弹窗没关掉」，中间没有「点 X:」明细 = 候选数组为空。
 
-现行实现改为**纯几何法**（`FIND_CLOSE_JS`），完全不依赖 class 名：
-1. 收集**所有**「innerText 含弹窗文案 + `position` 是 fixed/absolute + 面积 ≥120×100
-   但 **<92% 视口**」的容器，按面积**升序**取最紧的 8 个。
-   - 排除 92% 视口是必须的：背后那层半透明遮罩是 `fixed; inset:0`，面积正好等于视口，
-     若把它当成弹窗根，「右上角」就变成**页面右上角**，会乱点页面 UI。
-   - 取多个而不是只取一个：弹窗外面常常还套一层更大的 `fixed` wrapper，
-     只取「面积最大」会选到那层 wrapper，真正的 ✕ 相对它的角太远而被过滤掉。
-     多个容器**各自以自己的右上角为基准**算距离再合并打分，紧容器天然得低分而胜出。
-2. 每个容器内扫描小元素（8~90 px，`visibility/display/opacity` 可见），
-   算 `dx = 容器right - 元素right`、`dy = 元素top - 容器top`，窗口
-   `clamp(100, 容器尺寸*0.3, 240)`；在右上角之外（dx/dy < -6）或离太远就丢。
-   `aria-label/title/data-e2e/class` 含 `close|关闭|dismiss|cancel|✕|×` 的 **−1000 分**优先。
-3. 兜底给「**最紧**那个容器右上角内侧 32×32」的猜测点（pri 90000，最后才试）；
-   调用方在非最后一轮会**跳过** corner-guess，避免误点页面 UI。
-4. 点击循环：旧版 `for c in cands[:4]` 里点完第一个就 `break`，第一个猜错整轮白费；
+现行实现 = **文案锚点 + 祖先链 + 几何打分**（`FIND_CLOSE_JS`），不看 class、**也不看 position**：
+
+1. 找**最内层**含弹窗文案的元素当锚点（遍历 `*`，取 `textContent` 最短且含文案者；
+   用 `textContent` 而不是 `innerText`——后者会为每个元素触发排版，几千个元素会很慢）。
+2. 从锚点沿 `parentElement` 上溯，把每层「面积 ≥120×100 且 <92% 视口」的容器都收作候选，
+   **一遇到 ≥92% 视口的就停**（再往上就是全屏遮罩）。
+   - 为什么要靠祖先链：**09-17 第二次踩坑**。第一版几何法只收「`position` 是
+     fixed/absolute」的容器，结果 dump 实测 `{"vw":2552,"vh":1308,"root":null}` —— 文案确实
+     在页面正文里（不是 iframe），但**没有任何 fixed/absolute 容器装着它**。真实结构是
+     「全屏遮罩(fixed, 被 92% 规则排除) + 卡片(**position 是 relative/static**)」，
+     所以「按定位找容器」整条路必然前功尽弃。改走祖先链后卡片必然被收到。
+   - 另收一拨「fixed/absolute + 含文案」的容器（有些弹窗确实是那种结构）兜底。
+   - 候选按**面积升序**，每个容器**各自以自己的右上角**为基准打分再合并 →
+     外面还套一层大 wrapper 也不会把真 ✕ 挤出去（紧容器天然低分胜出）。
+3. 容器内扫 8~90 px 可见小元素，`dx = 容器right − 元素right`、`dy = 元素top − 容器top`，
+   窗口 `clamp(100, 容器尺寸*0.3, 240)`；在右上角之外或离太远就丢。
+   打分优先级：卡片内带 `close|关闭|dismiss|cancel|✕|×` 语义的（0）→
+   几何最贴角的（1000+dx+dy）→ 全局带「关闭」语义的（1500，可能点到别的弹窗）→
+   兜底「最紧容器右上角内侧 32×32」猜测点（90000，调用方前几轮会跳过它）。
+4. 点击循环：旧版 `for c in cands[:4]` 点完第一个就 `break`，第一个猜错整轮白费；
    现在**按优先级逐个点、每点一次就复查文案**，消失即返回，最多 6 个/轮。
-5. `cands` 为空时会调用 `POPUP_DUMP_JS` 把取证信息打进日志
-   （视口、候选容器（tag/class/label/title/data-e2e/坐标/内部文本）、右上角邻居 top14），
+5. `cands` 为空时（**只在第 1 轮**）调用 `POPUP_DUMP_JS` 把取证打进日志：
+   `vw/vh`、`anchor`、`chain`（锚点的祖先链，含 tag/class/position/坐标/文本）、
+   `roots`（候选容器）、`near`（右上角邻居 top8）。
    下次定位失败**直接从日志就能看出该点哪**，不用再单开探针
    （跑 A/B 时 Edge profile 被占用，另开探针会因 profile 锁失败）。
+   ⚠️ 这个 dump 是**第二次踩坑能定位的原因** —— 加它的成本很低，收益极高。
 
-**离线验证**：`out/_jscheck/test_find_close.js` 用桩 DOM 跑几何逻辑，7 个场景
-（哈希 class 命中 / aria-label 优先 / 1900×1070 大遮罩被排除 / 无弹窗根返回空 /
-容器过小返回空 / 兜底猜测点 / 外层大 wrapper 不干扰）全绿。
-`node out/_jscheck/test_find_close.js` 即可重跑。
+**离线验证（不占浏览器 profile，跑 A/B 时也能测）**
+
+```bash
+"$PY" tools/check_js.py douyin_id.py          # 把 py 里的 JS 常量抠出来做 node --check
+node out/_jscheck/test_find_close.js          # 桩 DOM 跑行为测试
+```
+
+- `tools/check_js.py`：用 AST 解析 `.py`，把 `*_JS` 常量抠到 `out/_jscheck/*.js`
+  （支持 `字面量` / `% (args,)` / `"..." + _COMMON + "..."` 拼接 / `json.dumps(list(...))`），
+  再用托管 node 跑 `--check`。Playwright 的 JS 负载在 Python 侧看不出语法错，
+  而跑 A/B 时又没法起探针 → **这是唯一能在运行间隙验证的方式**。
+- `test_find_close.js`：**9 个场景**全绿 —— 卡片 relative 命中 / 卡片 static 命中（证明不看
+  position）/ aria-label 优先 / 遮罩未被尺寸排除时紧容器仍胜出 / 外层大 wrapper 不干扰 /
+  无合格容器返回空 / 文案不存在返回空 / ✕ 在遮罩层用 label-global 兜住。
+- 桩 DOM 只需实现 `document.querySelectorAll`（按选择器过滤）、`getAttribute`、
+  `textContent`/`innerText`、`getBoundingClientRect`、`parentElement`、`querySelectorAll`、
+  `global.getComputedStyle`、`innerWidth/innerHeight`。
+- ⚠️ 写这类桩测**别在 JS 里用 `\\\\uXXXX`**：Python 非 raw 串里 `"\\u2715"` 到 JS 是
+  `'\u2715'`（JS 再解析成 ✕，正确），`"\\\\u2715"` 才是**字面量 6 字符串**（错误）。
+  直接写字符 `✕`/`×` 最省事。
 
 **其他实测结论**
 
