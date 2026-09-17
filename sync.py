@@ -53,6 +53,37 @@ def find_git():
 GIT = find_git()
 
 
+def _git_env():
+    """构造跑 git 用的环境变量。
+
+    🔴 **本环境适配 3**（2026-09-17 踩到）：WorkBuddy 自带的 PortableGit 是
+    **MinGit 精简布局** ——  `git --exec-path` 报 `mingw64/libexec/git-core`，
+    那个目录里**只有 shell 脚本、没有核心 helper**；真正的
+    `git-remote-http(s).exe` 只存在于 **`mingw64/bin`**。
+    后果：`commit` 正常，但 `push`/`pull` 一律报
+        git: 'remote-https' is not a git command. See 'git --help'.
+        fatal: remote helper 'https' aborted session
+    修法：显式把 `GIT_EXEC_PATH` 指到 `mingw64/bin`（并前置进 PATH）。
+    只在「默认 exec-path 确实缺 helper」时才覆盖，避免影响正常安装的 Git。
+    """
+    env = dict(os.environ)
+    if not os.path.isfile(GIT):
+        return env
+    root = os.path.dirname(os.path.dirname(GIT))          # <...>/versions/1.2.0
+    mb = os.path.join(root, "mingw64", "bin")
+    core = os.path.join(root, "mingw64", "libexec", "git-core")
+    helper_bin = os.path.join(mb, "git-remote-https.exe")
+    helper_core = os.path.join(core, "git-remote-https.exe")
+    if os.path.exists(helper_bin) and not os.path.exists(helper_core):
+        env["GIT_EXEC_PATH"] = mb
+        parts = [mb, os.path.join(root, "cmd"), os.path.join(root, "usr", "bin")]
+        env["PATH"] = os.pathsep.join(parts) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+GIT_ENV = _git_env()
+
+
 def hr(t=""):
     print("=" * 62)
     if t:
@@ -65,7 +96,8 @@ def run(args, capture=True, check=False):
     cmd = [GIT] + args
     try:
         p = subprocess.run(cmd, cwd=BASE, capture_output=capture,
-                           text=True, encoding="utf-8", errors="replace")
+                           text=True, encoding="utf-8", errors="replace",
+                           env=GIT_ENV)
     except FileNotFoundError:
         hr("❌ 找不到 git")
         print("git 路径： %s" % GIT)

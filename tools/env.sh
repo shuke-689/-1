@@ -59,6 +59,17 @@ done
 if [ ${#_git_c[@]} -gt 0 ]; then
   export GIT="${_git_c[$(( ${#_git_c[@]} - 1 ))]}"
   export PATH="${GIT%/*}:$PATH"
+  # ---- 3b) MinGit 布局补 GIT_EXEC_PATH ----
+  # WorkBuddy 自带的 PortableGit 是精简版：`git --exec-path` 指向
+  # mingw64/libexec/git-core，那里只有 shell 脚本；真正的 git-remote-http(s).exe
+  # 只在 mingw64/bin。不补的话 commit 正常但 push/pull 报
+  #   git: 'remote-https' is not a git command
+  _groot="${GIT%/*/*}"                       # <...>/PortableGit/versions/1.2.0
+  if [ -f "$_groot/mingw64/bin/git-remote-https.exe" ] && \
+     [ ! -f "$_groot/mingw64/libexec/git-core/git-remote-https.exe" ]; then
+    export GIT_EXEC_PATH="$_groot/mingw64/bin"
+    export PATH="$_groot/mingw64/bin:$_groot/cmd:$_groot/usr/bin:$PATH"
+  fi
 elif command -v git >/dev/null 2>&1; then
   export GIT="$(command -v git)"
 else
