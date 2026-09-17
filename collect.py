@@ -24,11 +24,20 @@
           历史：2026-09-15 之前是「视频结算总额」，09-15 改「结算总额」，09-16 改「直播结算总额」
           ⚠️ 用户 09-16 还要求过 5000-10w，但平台下拉只有 6 档、最细是「1w以下」，
              没有 5000 档 -> 用户确认落回 1w-10w
+          ⚠️ 平台这个筛选**不严格**（实测漏出约 10%，见规则2b），所以本地必须再拦一道
+  【规则2b】本地兜底过滤结算额（2026-09-17 新增）
+          按 live_low/live_high（= sale_info.live_total_sales_settle）与
+          SETTLE_MIN/SETTLE_MAX（由 SALE_OPTION 反推，默认 10000/100000）比对，
+          不合格或取不到数值的一律剔除。
+          起因：平台侧筛出来的 156 条里有 16 条实际不在 1w-10w，
+          其中 settle_live=0-0 的会污染飞书登记表（显示「结算总额 0-0」）。
+          可关：LOCAL_SETTLE_FILTER=0
   粉丝量 = 10w以下
   有联系方式 = 勾选
 本地过滤：
   性别 = 女(gender==2)
   排除地区：海南 / 新疆 / 西藏 / 境外
+  【规则2b】结算额兜底（见上）
   【规则4】主推类目(author_tag.main_cate)必须命中「个护家清」或「美妆」其一；
           目标词条（个护家清/美妆/服饰内衣/母婴宠物/运动户外）命中 >= 2 个 -> 第三个不限；
           只命中 1 个时，带以下 18 个搭档类目之一即排除：
@@ -161,6 +170,70 @@ RANGE_VALUE = {"1w以下": "1", "1w-10w": "2", "10w-100w": "3", "100w-500w": "4"
                "500w-1000w": "5", "1000w以上": "6",
                "10w以下": "1", "10w-100w": "2", "100w-300w": "3",
                "300w-500w": "4"}
+
+# 区间选项文本 -> 数值上下界（用于「本地兜底过滤」，见规则2b）
+# 与 RANGE_VALUE 一一对应，改档位时两张表一起改。
+RANGE_BOUNDS = {
+    "1w以下": (0, 10000),
+    "1w-10w": (10000, 100000),
+    "10w-100w": (100000, 1000000),
+    "100w-500w": (1000000, 5000000),
+    "500w-1000w": (5000000, 10000000),
+    "1000w以上": (10000000, 10 ** 12),
+    "10w以下": (0, 100000),
+    "100w-300w": (1000000, 3000000),
+    "300w-500w": (3000000, 5000000),
+}
+
+# 【规则2b】本地兜底过滤结算额（2026-09-17 新增）
+# ------------------------------------------------------------------
+# 为什么需要它：平台侧「直播结算总额 = 1w-10w」这个筛选**并不严格**。
+# 实测（2026-09-17 个护家清批次，out/collect_ghq.log）：
+#     [verify] 接口校验通过 {"common_range_selection_live_sales_30d_settle": ["2"]}   ← payload 是对的
+#     [15:51:33] 去重后 156 个达人
+#     [15:51:33] 校验：粉丝超10w 0 个 / 直播结算总额不在1w-10w 16 个      ← 约 10% 漏出
+# 漏出的达人在飞书登记表上就表现为「结算总额 = 0-0 / 直播结算总额 = 0-0」。
+# 本地过滤原先**完全没有**结算额这一关（只看 性别/地区/类目/内容/昵称），
+# 于是平台上漏一个，我们就收一个。
+# 现在按 live_low/live_high 再硬拦一道；取不到数值的一律剔除
+# （与本项目「未判定 -> 直接跳过」的既有口径一致）。
+# 需要临时关掉（例如想拿全量做对比）：LOCAL_SETTLE_FILTER=0
+LOCAL_SETTLE_FILTER = os.environ.get("LOCAL_SETTLE_FILTER", "1").lower() not in (
+    "0", "false", "no", "off", "")
+
+
+def _settle_bounds():
+    """由 SALE_OPTION 反推本地兜底区间。多选时取并集（min low / max high）。"""
+    los, his = [], []
+    for o in [x.strip() for x in SALE_OPTION.split("|") if x.strip()]:
+        b = RANGE_BOUNDS.get(o)
+        if b:
+            los.append(b[0])
+            his.append(b[1])
+    if not los or not his:
+        return (10000, 100000)          # 兜底默认：1w-10w
+    return (min(los), max(his))
+
+
+SETTLE_MIN, SETTLE_MAX = _settle_bounds()
+
+
+def settle_ok(live_low, live_high, lo=None, hi=None):
+    """规则2b 判定：直播结算额是否落在兜底区间内。
+
+    返回 (ok, note)。取不到数值（None / 非数字）一律判否 —— 与项目里
+    「未判定 -> 直接跳过」的既有口径一致。
+    抽成纯函数是为了能进 test_rules.py 回归（历史上这条规则漏过 10%）。
+    """
+    a = SETTLE_MIN if lo is None else lo
+    b = SETTLE_MAX if hi is None else hi
+    try:
+        x, y = int(live_low), int(live_high)
+    except Exception:
+        return False, "无数据(%s-%s)" % (live_low, live_high)
+    if x < a or y > b:
+        return False, "%s-%s" % (x, y)
+    return True, "%s-%s" % (x, y)
 # 高级筛选界面名 -> 接口字段名（用于 payload 端到端校验）
 SALE_FIELD_BY_LABEL = {
     "结算总额": "common_range_selection_author_sale_gmv_30d_settle",
@@ -1622,11 +1695,12 @@ def main():
 
         # ---------- 本地过滤 ----------
         seen, picked = set(), []
-        stat = {"dup": 0, "male": 0, "region": 0, "noprov": 0, "nocate": 0,
-                "catecombo": 0, "content": 0, "contentkeep": 0,
+        stat = {"dup": 0, "male": 0, "region": 0, "noprov": 0, "settle": 0,
+                "nocate": 0, "catecombo": 0, "content": 0, "contentkeep": 0,
                 "nickkw": 0, "nickbrand": 0}
         nick_drop = []                  # 记录被昵称规则剔除的样本，便于核对
         content_drop = []               # 记录被内容类型剔除的样本（新规则上线后要能核对）
+        settle_drop = []                # 记录被规则2b（结算额兜底）剔除的样本
         for r in rows:
             k = norm_name(r["nickname"])
             if not k or k in seen:
@@ -1642,6 +1716,15 @@ def main():
             if not any(p in city for p in CN_PROVINCE):
                 stat["noprov"] += 1
                 continue
+            # 规则2b：本地兜底过滤「直播结算总额」（平台侧筛选不严格，见文件头说明）
+            if LOCAL_SETTLE_FILTER:
+                _ok, _note = settle_ok(r["live_low"], r["live_high"])
+                if not _ok:
+                    stat["settle"] += 1
+                    if len(settle_drop) < 40:
+                        settle_drop.append("%s(live=%s)" % (
+                            (r["nickname"] or "")[:16], _note))
+                    continue
             # 规则4：主推类目 —— 命中「个护家清/美妆」其一；
             #        目标词条命中 >=2 个 -> 第三个及以后的类目不做限制；
             #        仅命中 1 个 -> 才查 18 项搭档排除表
@@ -1675,13 +1758,20 @@ def main():
             seen.add(k)
             picked.append(r)
         log("  本地过滤：重复 %d / 非女性 %d / 敏感地区 %d / 非大陆 %d "
-            "/ 无目标类目 %d / 排除类目组合 %d / 排除内容类型 %d "
+            "/ 结算额不合格 %d / 无目标类目 %d / 排除类目组合 %d / 排除内容类型 %d "
             "/ 昵称排除词 %d / 昵称品牌 %d -> 保留 %d" % (
                 stat["dup"], stat["male"], stat["region"], stat["noprov"],
-                stat["nocate"], stat["catecombo"], stat["content"],
+                stat["settle"], stat["nocate"], stat["catecombo"], stat["content"],
                 stat["nickkw"], stat["nickbrand"], len(picked)))
+        if LOCAL_SETTLE_FILTER:
+            log("  规则2b 结算额兜底：%s = %s-%s（平台侧筛选不严格，本地再拦一道）"
+                % (SALE_LABEL, SETTLE_MIN, SETTLE_MAX))
+        else:
+            log("  规则2b 结算额兜底：已关闭（LOCAL_SETTLE_FILTER=0）")
         log("  内容类型白名单（%s）另有 %d 个达人被明确保留"
             % ("/".join(CONTENT_KEEP), stat["contentkeep"]))
+        if settle_drop:
+            log("  结算额被剔除样本：%s" % " | ".join(settle_drop))
         if nick_drop:
             log("  昵称被剔除样本：%s" % " | ".join(nick_drop))
         if content_drop:

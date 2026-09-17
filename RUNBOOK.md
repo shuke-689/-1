@@ -188,6 +188,7 @@ export BATCH_COOLDOWN=300 MAX_RETRY=3      # 批次冷却 + 限流重试
 | | **直播结算总额 = 1w-10w**（2026-09-16 由「结算总额」改） | `common_range_selection_live_sales_30d_settle:["2"]` |
 | | 粉丝量 = 10w 以下 | `fans_num:["1"]` |
 | | 有联系方式 | `has_contact:true` |
+| **规则2b** | **本地兜底过滤结算额**（2026-09-17 新增，**默认开启**）：按 `live_low/live_high` 与 `SETTLE_MIN/SETTLE_MAX` 比对，不合格或**取不到数值**一律剔除 | `settle_ok(live_low, live_high)`；区间由 `SALE_OPTION` 反推（默认 `10000/100000`，多选取并集）；可用 `LOCAL_SETTLE_FILTER=0` 关掉 |
 | **规则3a** | 达人主页「带货分析」：**同一品牌占比 ≥ 50%**（且严格过半）→ 跳过 | `brand_verdict()`，阈值 `SAME_BRAND_RATIO`（默认 0.50）|
 | **规则3b** | 带货**商品名**命中禁忌词任一 → 跳过该达人。<br>词表：**假发 / 院线 / 美甲**（09-15）+ **充电宝 / 移动电源 / 3C数码 / 数码 / 数据线 / 充电器 / 充电头 / 蓝牙耳机**（09-17） | `product_exclude_hit(titles)`，词表 `PRODUCT_EXCLUDE_KW`（可用同名环境变量覆盖）|
 | **规则3c** | **去重后的带货店铺家数 ≤ MIN_SHOP_CNT（默认 2）** → 跳过（专营自己一家店的达人）<br>⚠️ 是**店铺家数**，不是商品件数 | `shopcnt_verdict(shops)`，阈值 `MIN_SHOP_CNT` |
@@ -232,6 +233,46 @@ export BATCH_COOLDOWN=300 MAX_RETRY=3      # 批次冷却 + 限流重试
 > 达人详情里的实际数值在接口 `sale_info.*`：
 > `total_sales_settle` / `live_total_sales_settle` / `video_total_sales_settle` / `image_text_total_sales_settle`
 > （各含 `sale_low` / `sale_high` 区间）。
+
+### ⚠️ 平台侧「直播结算总额」筛选**不严格** —— 必须靠规则2b 兜底（2026-09-17 实测）
+
+**用户问过：「我设置的不是 1-10W 的直播结算额么，为何会出现结算总额为 0？」**
+
+实证（`out/collect_ghq.log`，个护家清批次）：
+
+```
+[15:50:18]   [verify] 接口校验通过：{"common_range_selection_live_sales_30d_settle": ["2"], ...}   ← 我们发的筛选是对的
+[15:51:33]   去重后 156 个达人
+[15:51:33]   校验：粉丝超10w 0 个 / 直播结算总额不在1w-10w 16 个                                  ← 漏出 16 条 ≈ 10%
+```
+
+结论链条：
+1. **payload 完全正确** —— `common_range_selection_live_sales_30d_settle:["2"]`（=1w-10w），`[verify]` 行可证；
+2. **平台返回的数据不守约** —— 156 条里 16 条（≈10%）的 `sale_info.live_total_sales_settle`
+   实际不在 1w-10w。平台按自己的分档索引返回，与我们读到的数值快照不是同一份；
+3. **`0-0` 是真实源数据，不是格式 bug** —— `fmt_range()` 在取不到值时输出**空串**，
+   只有平台真的返回 `sale_low:0, sale_high:0` 才会显示 `0-0`；
+4. **本地过滤原先没有结算额这一关** —— 只看 性别/地区/类目/内容/昵称，
+   `bad_settle()` **只打日志不拦数据** → 平台上漏一个就收一个，然后写进飞书。
+
+飞书登记表的污染面（2026-09-17 体检，`"$PY" feishu_audit.py`）：
+
+| 数据源 | 总数 | `settle_live = 0-0` |
+|---|---|---|
+| 飞书表实况 | 59 条 | **7 条**（6 条已申请 / 1 条添加失败）|
+| `out/collect/darens_prev.json.bak`（历史全量）| 139 条 | 16 条 |
+| 今天 ghq 批次的 38 条候选 | 38 条 | **1 条**（华姐教护肤2）|
+
+7 条异常行：`鱼鱼护肤甄选`、`鑫鑫—美妆仓库`、`高高（美妆版）`、`草莓熊熊熊✈️`、
+`25点就睡`、`桃圆圆`、`华姐教护肤2`。
+其中前 6 条是**改口径之前的旧数据**（09-15 前筛的是「视频结算总额」，纯短视频/图文达人
+`live_total_sales_settle` 天然为 0，当时能进来；09-16 换成直播口径后本不该再进，
+但**旧名单不会自动重筛**）。只有 `华姐教护肤2` 是今天新收的，说明平台当前仍在漏。
+
+**修复**：新增**规则2b**（见上表），在本地过滤里按 `live_low/live_high` 硬拦一道；
+12 组单测在 `.probe/test_rules.py` 的 `SETTLE_CASES`。
+回查历史遗留用 `"$PY" feishu_audit.py`（只读，不写库）。
+
 
 > 接口字段参考：个护家清 `main_cate_new:["5","5"]`、美妆 `main_cate_new:["9","9"]`。
 > 可用环境变量覆盖：`CATE_PARENT` / `CATE_CHILD`（默认 个护家清 / 不限；
@@ -376,6 +417,10 @@ export BATCH_COOLDOWN=300 MAX_RETRY=3      # 批次冷却 + 限流重试
 **本地过滤规则**
 - 仅女性：`gender == 2`
 - 排除区域：海南 / 新疆 / 西藏 / 香港 / 澳门 / 台湾 / 海外 / 国外
+- **规则2b**（2026-09-17 新增，默认开启）：`settle_ok(live_low, live_high)` ——
+  直播结算额必须落在 `SETTLE_MIN~SETTLE_MAX`（默认 10000~100000，由 `SALE_OPTION` 反推）。
+  **取不到数值 → 未判定 → 剔除**。起因见上文「平台侧筛选不严格」一节。
+  关掉用 `LOCAL_SETTLE_FILTER=0`。
 - **规则4**：`cate_verdict()` —— 必须命中 个护家清/美妆 其一；目标词条
   （个护家清/美妆/服饰内衣/母婴宠物/运动户外）命中 **≥2 个**则第三个及以后不限；
   只命中 1 个时才查 18 项搭档排除表
@@ -624,6 +669,21 @@ tools/run_b_rounds.sh 10 30 60               # LIMIT / MAX_ROUNDS / 轮间秒数
    **不在 `fields` 下**。按 `r["fields"]` 取会**一条都读不到**（曾静默返回「表内已有 0 条」，
    后果是重复插入 55 行）。另：`--output` 目标已存在时必须加 `--overwrite`。
 
+**体检工具 —— `feishu_audit.py`（2026-09-17 新增，只读）**
+
+回查表里有没有结算额异常的行（三列全 `0-0` / 空）。起因见
+「平台侧『直播结算总额』筛选不严格」一节 —— 平台漏出的 0-0 达人曾被原样写上表。
+
+```bash
+"$PY" feishu_audit.py           # 列出异常行
+"$PY" feishu_audit.py --json    # 另存 out/feishu/audit.json
+```
+
+> 只调 `record-list`，**绝不写库、不删行**。处理方式（删行 / 保留）由用户定。
+> 2026-09-17 实测：表内 59 条，异常 **7** 条
+> （`鱼鱼护肤甄选`、`鑫鑫—美妆仓库`、`高高（美妆版）`、`草莓熊熊熊✈️`、
+> `25点就睡`、`桃圆圆`、`华姐教护肤2`）。
+
 ---
 
 ## 3.8 取「达人抖音号」 —— `douyin_id.py`（阶段C 的依赖）
@@ -746,6 +806,7 @@ node out/_jscheck/test_find_close.js          # 桩 DOM 跑行为测试
 | `out/wechat/add_results.json` | 阶段B 结果（含 `add_status` / `add_note`） |
 | `out/wechat/steps/*.png` | 每一步的截图（搜索页/申请页/前后对比），用于复盘 |
 | `out/feishu/*.json` / `existing.ndjson` | 阶段C 提交载荷与表内已有记录快照 |
+| `out/feishu/audit.json` | `feishu_audit.py --json` 的体检结果（结算额异常行） |
 | `out/probe_douyin*/` | 取抖音号的探针产物（含**串号 bug 的截图证据**） |
 
 ---
