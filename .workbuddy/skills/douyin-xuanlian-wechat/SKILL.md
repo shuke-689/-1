@@ -144,6 +144,15 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
    `dismiss_popup()` 点右上角 ✕（靠**文案**判定有弹窗，**不能靠遮罩**
    —— 抖音主页本身就有铺满的容器，按遮罩会到处误点）。关不掉也不阻塞读取。
    该弹窗本来就只挡中间，顶部「昵称+抖音号」一直读得到。
+   ⚠️ **抖音 class 名是哈希串**（`J8iVz0S9`），`[class*="close"]` 永远匹配不到 →
+   关闭按钮定位必须用**几何法**：找「innerText 含弹窗文案 + fixed/absolute +
+   面积 <92% 视口」的容器（按面积升序取最紧的 8 个，**排除全屏遮罩**、
+   **多容器各自求角再合并打分**，以防外面还套一层大 wrapper），
+   在右上角窗口内找 8~90 px 小元素，`aria-label/title/data-e2e/class` 含
+   close|关闭|dismiss|cancel|✕|× 的优先；兜底点最紧容器右上角内侧 32×32。
+   **判据**：日志出现「检测到弹窗」后若**没有**紧跟「点 X: tag=…」明细，
+   就是候选数组为空 = 定位失败；此时会打印 `取证: {...}` dump（视口/容器/右上角邻居），
+   照 dump 就能定位。离线回归：`node out/_jscheck/test_find_close.js`（7 场景）。
 
 **达人主页「带货分析」的四条带货规则（2026-09-17 已扩到 3a~3d）**
 
@@ -209,9 +218,16 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
   ⚠️ 但**不要据此长期放量**：我们只观察到「没触发」，**没观察到安全边界在哪**，
   而且风控可能是**延迟或事后**生效的（比如过一会儿才限制）。
   默认节奏照旧；用户要求连跑时先报当天已发次数，由他决定。
-- 连跑做法：写循环跑 `run --limit N`，检测 `结果统计:.*risk_control` 即 break，
-  「没有待加好友了」也 break；**每轮输出 tee 到单独日志**（`run()` 会覆盖
-  `out/wechat_add.log`，不 tee 就丢掉历史轮次）。
+- 连跑做法：用 **`tools/run_b_rounds.sh [LIMIT] [MAX_ROUNDS] [GAP_SEC]`**（默认 10 / 30 / 60）。
+  它循环跑 `run --limit N`，命中任一条件即停：
+  ① `检测到微信风控` → 退出码 2；② `找不到「添加朋友」窗口` → 退出码 3（先开窗口再跑）；
+  ③ `没有待加好友了` 或 `剩余待加 0 个` → 退出码 0；④ 到最大轮数。
+  **每轮输出 tee 到 `out/wechat_add_rounds.log`**（`run()` 会覆盖 `out/wechat_add.log`，
+  不 tee 就丢掉历史轮次）。
+  ⚠️ 脚本自己不检查微信前置条件，也不替用户开窗口；启动前必须口头确认
+  「微信已登录 + 添加朋友窗口已打开且未被遮挡 + 期间勿动键鼠」。
+  ⚠️ 写这类脚本**不能用 `dirname` 定位自身目录**（`tools/env.sh` 顶部注明：补 usr/bin
+  是 env.sh 的活儿，dirname 就在那里面）——用纯 bash 参数展开 `${BASH_SOURCE[0]%/*}`。
 
 `wechat_add.py` 自带**多轮台账**（`out/wechat/add_results.json`），
 `run` 会跳过已完成达人、从断点继续，不会重复处理。
@@ -332,6 +348,8 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 | 飞书表里出现同名两行 / 该更新的没更新 | 幂等键是**达人名称**，改名就会新建行；确认 `--dry` 输出的待新增/待更新数 |
 | 抖音号取回来看起来是别人的 | **串号 bug** → 看 RUNBOOK 3.8；日志应有「页面含该达人昵称=True」，为 False 就该怀疑 |
 | 抖音主页弹登录框挡事 | 已内置 `dismiss_popup()` 点 ✕；关不掉也不影响读顶部抖音号 |
+| 日志只有「检测到弹窗→点 X 关闭」紧跟「⚠️ 弹窗没关掉」，中间**没有**「点 X: tag=…」 | 关闭按钮**一个候选都没找到**（抖音 class 是哈希串，`[class*=close]` 无效）→ 已改几何法，见 RUNBOOK 3.8；同时看紧随其后的 `取证: {...}` dump |
+| 想复现/回归弹窗定位逻辑 | `node out/_jscheck/test_find_close.js`（桩 DOM，7 场景，无需浏览器/不占 profile） |
 | `status` 报的待加数比实际加的多 | 已修：`status` 现在也过规则7 过滤器；若仍不一致，检查是否用了旧版脚本 |
 
 诊断探针（`.probe/`）：`probe_login.py`、`probe_api.py <类目>`、
@@ -343,9 +361,31 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 ```bash
 "$PY" .probe/test_rules.py      # 类目组合 + 禁忌商品名（28 组）
 "$PY" .probe/test_brand.py      # 带货同品牌占比判定（11 组）
-"$PY" .probe/test_new_rules.py  # 禁忌词扩展 + 店铺家数 + 低价铺货 + 价格解析 + 规则7 昵称排除词
+"$PY" .probe/test_new_rules.py  # 禁忌词 + 店铺家数 + 低价铺货 + 价格解析 + 养发占比(3e) + 纯数字昵称(7c)
+"$PY" -m py_compile douyin_id.py collect.py   # 语法自检
 ```
 
 **改任何规则后必须跑这三个**，全绿才算改完。
 （`test_new_rules.py` 里规则7 的用例已覆盖两批新增词 13 个 + 反向「不该命中」用例；
 加新词时**同时加正反用例**，尤其 `睫毛`/`香水`/`源头` 这类容易误伤的词。）
+
+**Playwright JS 的离线回归（不占浏览器 profile，跑 A/B 时也能测）**
+
+给 `page.evaluate()` 用的 JS 字符串没法单测，也**不能在跑 A/B 时另开探针**
+（Edge profile 被占，第二个实例起不来）。办法是**把 JS 从 .py 里抠出来，用桩 DOM 在 node 里跑**：
+
+```python
+# 抠 JS：ast 取赋值右侧，若有 `% json.dumps(...)` 就先把 %s 填掉
+body = node.value.left if isinstance(node.value, ast.BinOp) else node.value
+js = body.value % (json.dumps(KW, ensure_ascii=False),)
+open('out/_jscheck/FIND_CLOSE_JS.js','w',encoding='utf-8').write("const f = " + js + ";\n")
+```
+```bash
+"$NODE" --check out/_jscheck/FIND_CLOSE_JS.js        # 语法
+"$NODE" out/_jscheck/test_find_close.js              # 桩 DOM 行为（7 场景）
+```
+桩 DOM 只要实现 `document.querySelectorAll` / `getAttribute` / `getBoundingClientRect`
+/ `querySelectorAll` / `global.getComputedStyle` / `innerWidth·innerHeight` 就够了。
+⚠️ 写桩测时**别在 JS 里用 `\\\\uXXXX`**：Python 非 raw 字符串里 `"\\u2715"` 到 JS 是
+`'\u2715'`（JS 再解析成 ✕，正确），`"\\\\u2715"` 才是**字面量 6 字符串**（错误）。
+干脆直接写字符 `✕`/`×` 最省事。
