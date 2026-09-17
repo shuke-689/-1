@@ -10,7 +10,8 @@
 
 筛选条件：
   【规则1】主推类目 = 个护家清 / 美妆（级联面板里选「不限」）
-          双类目分两批跑（见 collect_30.py）：15 个个护家清 + 15 个美妆
+          双类目分两批跑（见 collect_30.py）：个护家清 + 美妆
+          （每批目标有效达人数由 GHQ_TARGET / MZ_TARGET 控制，默认各 30）
           放行的类目组合（用户 2026-09-15 最新口径）：
             个护家清｜个护家清+美妆｜美妆｜个护家清+服饰内衣｜
             个护家清+母婴宠物｜个护家清+运动户外
@@ -34,9 +35,15 @@
           食品饮料 / 滋补保健 / 宠物 / 图书教育 / 生鲜 / 本地生活 / 酒 /
           智能家居 / 玩具乐器 / 鲜花园艺 / 3C数码家电 / 鞋靴箱包 / 虚拟充值 /
           钟表配饰 / 珠宝文玩 / 医疗健康 / 原料包装 / 餐饮外卖
-  【规则6】达人内容类型(author_tag.author_label_rec_reasons[].reason)不得命中：
-          三农 / 公益 / 人文社科 / 二次元 / 医疗健康 / 动物 / 教育校园 / 汽车 /
-          游戏 / 生活家居 / 社会时政 / 科技 / 科普 / 美食 / 职场 / 财经
+  【规则6】达人内容类型(author_tag.author_label_rec_reasons[].reason)：
+          6a **白名单优先**（用户 2026-09-17 新增）—— 命中以下任一**直接保留**，
+             即使同时命中了 6b 的黑名单：
+             亲子 / 剧情 / 时尚 / 情感 / 文化 / 旅行 / 明星 / 母婴 /
+             舞蹈 / 音乐 / 颜值 / 体育 / 摄影摄像
+          6b 未命中白名单时，命中以下任一项才排除：
+             三农 / 公益 / 人文社科 / 二次元 / 医疗健康 / 动物 / 教育校园 / 汽车 /
+             游戏 / 生活家居 / 社会时政 / 科技 / 科普 / 美食 / 职场 / 财经
+          （改前是纯黑名单「任一命中即排除」，把「时尚+美食」这类误杀了）
   【规则7】昵称命中排除词：国际 / 全球 / 美业 / 供应链 / 折扣 / 厂家 / 大牌 /
           养发 / 集团 / 防晒；或带品牌号特征词（官方/旗舰/专卖/授权/正品/品牌…）
           或命中品牌词表（蜜丝婷、百雀羚、云南白药…）-> 排除
@@ -45,13 +52,22 @@
   【规则5】取满 TARGET_DAREN 个「有效达人」（成功取到联系方式的）即停止筛选
 达人主页：
   跳 /dashboard/servicehall/daren-profile?uid=<uid>
-  【规则3】**必须先点「带货分析」tab**，读「商品信息」+「店铺信息」两列：
+  【规则3】跳达人主页后**必须先点「带货分析」tab**，读「商品信息」+「店铺信息」+「到手价」：
       3a 同品牌：按品牌聚类（店名去店型后缀 -> 公共前缀 >=2 字视为同品牌）
       **同一品牌占比 >= SAME_BRAND_RATIO（默认 50%）且严格过半 -> 跳过该达人**
       多家品牌（最大占比 < 50%，或打平）-> 继续
       3b 禁忌商品：商品名含 假发 / 院线 / 美甲 -> **跳过该达人**
+                   用户 2026-09-17 追加：含 充电宝 / 移动电源 / 3C数码 / 数码 /
+                   数据线 / 充电器 / 充电头 / 蓝牙耳机 -> **跳过**
+      3c 店铺数少：去重后的**店铺家数 <= MIN_SHOP_CNT（默认 2）** -> 跳过
+                   （用户 2026-09-17 追加；专营自己一家店的达人一律不要）
+      3d 低价铺货：**>= CHEAP_RATIO（默认 90%）的商品到手价 < CHEAP_PRICE（默认 30 元）**
+                   -> 跳过（用户 2026-09-17 追加）
+      ⚠️ 到手价格式实测为 "￥59.90" / "￥29.90 ￥69.90"（第一个数才是到手价）
+      ⚠️ 价格可解析比例 < PRICE_MIN_PARSE（默认 80%）= **未判定 -> 也跳过**
       ⚠️ tab 点不到 / 商品数据拿不到 = **未判定 -> 直接跳过该达人**，
          绝不"未判定就进入查微信"（用户 2026-09-15 明确要求的纠错）
+      ⚠️ 商品表是分页的（首页约 15 行），3a/3c/3d 都是基于首页样本判定
   【规则7b】若昵称命中该达人自己的带货品牌名 -> 跳过（动态品牌判定，不依赖静态词表）
   取「达人微信号」行（无则退「达人手机号」行）→ 点眼睛 → 取值
 
@@ -66,6 +82,7 @@ import csv
 import io
 import json
 import os
+import re
 import sys
 import time
 
@@ -136,9 +153,31 @@ LOGIN_PAGE_BAD = ("404 Not Found", "not found", "nginx")
 SALE_LABEL = os.environ.get("SALE_LABEL", "直播结算总额")
 SALE_OPTION = os.environ.get("SALE_OPTION", "1w-10w")
 
+# 区间选项文本 -> 接口 value（位置就是 value，1~6；结算类与粉丝量共用这套）
+RANGE_VALUE = {"1w以下": "1", "1w-10w": "2", "10w-100w": "3", "100w-500w": "4",
+               "500w-1000w": "5", "1000w以上": "6",
+               "10w以下": "1", "10w-100w": "2", "100w-300w": "3",
+               "300w-500w": "4"}
+# 高级筛选界面名 -> 接口字段名（用于 payload 端到端校验）
+SALE_FIELD_BY_LABEL = {
+    "结算总额": "common_range_selection_author_sale_gmv_30d_settle",
+    "直播结算总额": "common_range_selection_live_sales_30d_settle",
+    "视频结算总额": "common_range_selection_video_sales_30d_settle",
+    "图文结算总额": "common_range_selection_picture_sales_30d_settle",
+    "橱窗结算总额": "common_range_selection_window_sales_30d_settle",
+}
+FANS_LABEL = "粉丝量"
+FANS_OPTION = "10w以下"
+FANS_FIELD = "fans_num"
+CONTACT_FIELD = "has_contact"
+CATE_FIELD = "main_cate_new"
+# 类目名 -> 接口 id（实测自 payload，仅用于校验；选类目本身仍走 UI 级联）
+CATE_ID_BY_NAME = {"个护家清": "5", "美妆": "9"}
+
 # 【规则1】主推类目 = 「个护家清」（级联菜单里选「不限」= 整个个护家清大类）
 # 如需只取某个子类目，设 CATE_CHILD=个人护理 / 家清纸品
-# 用户 2026-09-15 追加：类目再加「美妆」（同样选「不限」），最终 15 个护家清 + 15 美妆
+# 用户 2026-09-15 追加：类目再加「美妆」（同样选「不限」）
+# 每批目标有效达人数见 collect_30.py 的 GHQ_TARGET / MZ_TARGET（默认各 30）
 CATE_PARENT = os.environ.get("CATE_PARENT", "个护家清")
 CATE_CHILD = os.environ.get("CATE_CHILD", "不限")
 CATES = ((CATE_PARENT, CATE_CHILD),)
@@ -169,12 +208,34 @@ CATE_EXCLUDE_PARTNER = (
     "钟表配饰", "珠宝文玩", "医疗健康", "原料包装", "餐饮外卖",
 )
 
-# 【规则3b】带货商品名称命中以下词 -> 排除该达人（用户 2026-09-15 追加）
-PRODUCT_EXCLUDE_KW = ("假发", "院线", "美甲")
+# 【规则3b】带货**商品名称**命中以下词 -> 排除该达人
+#   3b 用户 2026-09-15 追加：假发 / 院线 / 美甲
+#   3b 用户 2026-09-17 追加：「商品中带充电宝类的，3C数码产品的，进行跳过」
+#      ⚠️ 刻意**不**用裸 "3C" —— 它是美妆品牌「3CE」的子串，会把正规美妆达人误杀；
+#         要覆盖 3C 就写全 "3C数码"。
+#      可用环境变量覆盖：export PRODUCT_EXCLUDE_KW="假发,院线,美甲,充电宝"
+PRODUCT_EXCLUDE_KW = tuple(
+    x.strip() for x in os.environ.get(
+        "PRODUCT_EXCLUDE_KW",
+        "假发,院线,美甲,充电宝,移动电源,3C数码,数码,数据线,充电器,充电头,蓝牙耳机",
+    ).split(",") if x.strip()
+)
 
 # 【规则6】达人内容类型（author_tag.author_label_rec_reasons[].reason，覆盖率 100%）
 #        不得属于以下类型（任一带命中即排除）
 #        注意：用户口语「人文」= 平台正式名「人文社科」
+# 【规则6】内容类型
+# 6a 白名单（用户 2026-09-17 新增）：命中以下任一 -> **直接保留**，
+#    即使同时命中下面的 CONTENT_EXCLUDE。
+#    用户原话：「达人内容类型中，保留 亲子、剧情、时尚、情感、文化、旅行、明星、母婴、
+#              舞蹈、音乐、颜值、体育、摄影摄像」
+#    背景：以前是纯黑名单「任一命中即排除」，导致「时尚+美食」这类被误杀，
+#          用户观察到「有很多时尚的、符合类目的，均未筛选到」。
+CONTENT_KEEP = (
+    "亲子", "剧情", "时尚", "情感", "文化", "旅行", "明星", "母婴",
+    "舞蹈", "音乐", "颜值", "体育", "摄影摄像",
+)
+# 6b 黑名单：**没有**命中白名单时，命中以下任一项才排除
 CONTENT_EXCLUDE = (
     "三农", "公益", "人文社科", "二次元", "医疗健康", "动物", "教育校园", "汽车",
     "游戏", "生活家居", "社会时政", "科技", "科普", "美食", "职场", "财经",
@@ -268,14 +329,20 @@ SCAN_JS = """() => {
 }"""
 
 FIND_FORMITEM_JS = """(name) => {
-    let out = null;
+    // 优先精确匹配；选中后 innerText 会变成「名称+已选值」，所以退化为前缀匹配。
+    // （前缀匹配在本页是安全的：结算总额/直播结算总额/视频结算总额互不为前缀）
+    let exact = null, prefix = null;
     document.querySelectorAll('div.auxo-form-item').forEach(e => {
-        if ((e.innerText||'').trim() !== name) return;
+        const t = (e.innerText||'').trim();
         const r = e.getBoundingClientRect();
         if (r.width < 20 || r.height < 10) return;
-        out = {x:Math.round(r.x), y:Math.round(r.y), w:Math.round(r.width), h:Math.round(r.height)};
+        if (t === name) exact = e;
+        else if (!prefix && t.startsWith(name)) prefix = e;
     });
-    return out;
+    const hit = exact || prefix;
+    if (!hit) return null;
+    const r = hit.getBoundingClientRect();
+    return {x:Math.round(r.x), y:Math.round(r.y), w:Math.round(r.width), h:Math.round(r.height)};
 }"""
 
 FIND_CATE_JS = """(name) => {
@@ -333,6 +400,59 @@ DROPDOWN_JS = """() => {
             items: items};
 }"""
 
+# 列出**所有**可见下拉（DROPDOWN_JS 只取最后一个，多个浮层同时存在时会串字段）
+ALL_DROPDOWNS_JS = """() => {
+    const dds = Array.from(document.querySelectorAll('.auxo-select-dropdown'))
+        .filter(e => e.getBoundingClientRect().height > 10);
+    return dds.map(dd => {
+        const dr = dd.getBoundingClientRect();
+        const items = Array.from(dd.querySelectorAll('.auxo-select-item-option-content')).map(e => {
+            const r = e.getBoundingClientRect();
+            return {t:(e.innerText||'').trim(), x:Math.round(r.x), y:Math.round(r.y),
+                    w:Math.round(r.width), h:Math.round(r.height),
+                    selected: !!e.closest('.auxo-select-item-option-selected')};
+        });
+        return {box:{x:Math.round(dr.x), y:Math.round(dr.y),
+                     w:Math.round(dr.width), h:Math.round(dr.height)},
+                items: items};
+    });
+}"""
+
+# 关浮层：auxo 的**多选**下拉按 Escape 关不掉（2026-09-17 实测），
+# 改用「在 body 上派发一次外侧点击」触发它自己的 outside-click 关闭逻辑。
+CLOSE_DROPDOWN_JS = """() => {
+    ['mousedown','mouseup','click'].forEach(t => {
+        document.body.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true}));
+    });
+    return Array.from(document.querySelectorAll('.auxo-select-dropdown'))
+        .filter(e => e.getBoundingClientRect().height > 10).length;
+}"""
+
+# 用 JS 直接点 form-item —— 绕过「鼠标点落在浮层上被吞掉」的问题
+CLICK_FORMITEM_JS = """(name) => {
+    let hit = null;
+    document.querySelectorAll('div.auxo-form-item').forEach(e => {
+        if ((e.innerText||'').trim() !== name) return;
+        const r = e.getBoundingClientRect();
+        if (r.width < 20 || r.height < 10) return;
+        hit = e;
+    });
+    if (!hit) return false;
+    const target = hit.querySelector('.auxo-select, button, .auxo-form-item-control') || hit;
+    target.click();
+    return true;
+}"""
+
+# 读某筛选项当前的回显文本（选中后 innerText 会变成「名称+已选值」，所以用 startsWith）
+FORMITEM_TEXT_JS = """(name) => {
+    let out = null;
+    document.querySelectorAll('div.auxo-form-item').forEach(e => {
+        const t = (e.innerText||'').trim().replace(/\\s+/g, ' ');
+        if (t === name || t.startsWith(name)) out = t.slice(0, 80);
+    });
+    return out;
+}"""
+
 # 级联菜单里的子类目（如「个护家清 -> 个人护理」）
 FIND_CASCADER_JS = """(name) => {
     let out = null;
@@ -383,9 +503,13 @@ FIND_TAB_JS = """(name) => {
 
 # 带货分析表格：实测列头 = 商品信息 | 店铺信息 | 到手价 | 结算额区间 |
 #               销量区间 | 关联直播场次 | 关联短视频数
-# 一次把「商品名 + 店铺名」都取回来：
+# 一次把「商品名 + 店铺名 + 到手价」都取回来：
 #   店铺名 -> 规则3（同一品牌占比 >= 50% 则跳过）
-#   商品名 -> 规则3b（含 假发 / 院线 / 美甲 -> 跳过）
+#             规则3a（去重店铺家数 <= 2 则跳过）
+#   商品名 -> 规则3b/3c（含 假发/院线/美甲/充电宝/3C数码… -> 跳过）
+#   到手价 -> 规则3d（>= 90% 商品价格 < 30 元 -> 跳过）
+#   ⚠️ 表格是**分页**的，首页只渲染约 15 行（表头旁边会写「共 N 个带货商品」），
+#      所以这三条规则都是在「首页样本」上判定，不是全量。
 SHOP_ROWS_JS = """() => {
     const tables = Array.from(document.querySelectorAll('table'));
     for (const tb of tables) {
@@ -395,6 +519,8 @@ SHOP_ROWS_JS = """() => {
         const ti = heads.findIndex(h => h.indexOf('商品') >= 0);
         const si = heads.findIndex(h => h.indexOf('店铺') >= 0);
         if (si < 0) continue;
+        let pi = heads.findIndex(h => h.indexOf('到手价') >= 0);
+        if (pi < 0) pi = heads.findIndex(h => h.indexOf('价格') >= 0);
         const out = [];
         tb.querySelectorAll('tbody tr').forEach(tr => {
             const tds = tr.querySelectorAll('td');
@@ -402,12 +528,15 @@ SHOP_ROWS_JS = """() => {
                 ? (tds[ti].innerText||'').trim().replace(/\\s+/g, ' ').slice(0, 80) : '';
             const shop = tds[si]
                 ? (tds[si].innerText||'').trim().replace(/\\s+/g, ' ').slice(0, 40) : '';
-            if (title || shop) out.push({title: title, shop: shop});
+            const price = (pi >= 0 && tds[pi])
+                ? (tds[pi].innerText||'').trim().replace(/\\s+/g, ' ').slice(0, 40) : '';
+            if (title || shop) out.push({title: title, shop: shop, price: price});
         });
         if (out.length) return out;
     }
     return [];
 }"""
+
 
 
 # ---------------- 列表滚动（翻页） ----------------
@@ -449,6 +578,20 @@ SCROLL_LIST_JS = "(dy) => {" + _PICK_SCROLLER + """
 # 【规则3】带货分析：同一品牌占比达到该阈值 -> 跳过该达人
 # 用户 2026-09-15 定：先 70%，随后上调为 **50%**
 SAME_BRAND_RATIO = float(os.environ.get("SAME_BRAND_RATIO", "0.50"))
+
+# ===== 用户 2026-09-17 追加的三条带货规则 =====
+# 【规则3c】所带商品的**店铺数** <= 该值 -> 跳过（专卖自己一家店的达人）
+#   注意：这是**去重后的店铺家数**，不是商品件数（商品件数见 r["shop_rows"]）。
+#   实测样本：嬉笑闫开护肤品批发，15 件商品全部来自「嬉笑闫开护肤」1 家店 -> 命中
+MIN_SHOP_CNT = int(os.environ.get("MIN_SHOP_CNT", "2"))
+# 【规则3d】所带商品中**价格 < CHEAP_PRICE 的比例** >= CHEAP_RATIO -> 跳过（低价铺货型）
+#   用户原话：「带人所带商品，价格90%以上小于30元，进行跳过」
+CHEAP_PRICE = float(os.environ.get("CHEAP_PRICE", "30"))
+CHEAP_RATIO = float(os.environ.get("CHEAP_RATIO", "0.90"))
+#   价格可解析的最低比例：解析不出来就当「未判定」-> 跳过（绝不未判定就查微信）
+#   实测到手价单元格形如 "￥59.90" / "￥29.90 ￥69.90"（**第一个数才是到手价**，
+#   后面那个是划线原价），空值/异常给 "-"。
+PRICE_MIN_PARSE = float(os.environ.get("PRICE_MIN_PARSE", "0.80"))
 
 
 def _common_prefix(a, b):
@@ -576,6 +719,58 @@ def product_exclude_hit(titles):
     return next((kw for kw in PRODUCT_EXCLUDE_KW if kw in blob), "")
 
 
+# 到手价格式（2026-09-17 实测 dump 自 out/probe_price/dump_*.json）：
+#   "￥59.90"                -> 59.90
+#   "￥29.90 ￥69.90"        -> 29.90   ← **第一个数是到手价**，第二个是划线原价
+#   "￥1,299.00"             -> 1299.0  （千分位）
+#   "-" / "" / "暂无"        -> None
+#   注意符号是全角 ￥(U+FFE5)，也可能出现半角 ¥，这里只认数字，符号随意。
+_PRICE_NUM_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def parse_price(text):
+    """从「到手价」单元格文本里取出到手价数字；取不到返回 None。"""
+    if not text:
+        return None
+    m = _PRICE_NUM_RE.search(str(text))
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def cheap_verdict(prows):
+    """【规则3d】所带商品「价格 < CHEAP_PRICE 的比例」>= CHEAP_RATIO -> 跳过。
+
+    返回 (是否跳过, 低价占比, 可解析数, 总行数, 原因)
+      原因取值："cheap"（命中）/ "fewprice"（价格样本不足·未判定）/ ""
+    ⚠️ 未判定 -> 也跳过，遵循项目既有铁律「绝不未判定就查微信」。
+    """
+    n_all = len(prows or [])
+    prices = [p for p in (parse_price(x.get("price")) for x in (prows or []))
+              if p is not None]
+    n_ok = len(prices)
+    if not n_all or n_ok < max(3, int(n_all * PRICE_MIN_PARSE)):
+        return False, 0.0, n_ok, n_all, "fewprice"
+    cheap = sum(1 for p in prices if p < CHEAP_PRICE)
+    ratio = cheap / float(n_ok)
+    if ratio >= CHEAP_RATIO:
+        return True, ratio, n_ok, n_all, "cheap"
+    return False, ratio, n_ok, n_all, ""
+
+
+def shopcnt_verdict(shops):
+    """【规则3c】去重后的带货店铺家数 <= MIN_SHOP_CNT -> 跳过。
+
+    返回 (是否跳过, 店铺家数, 店铺名列表)
+    只认店铺名本身；同一家店写法有差异会算成两家（宁可漏杀，不可错杀）。
+    """
+    uniq = sorted({s.strip() for s in (shops or []) if s and s.strip()})
+    return len(uniq) <= MIN_SHOP_CNT, len(uniq), uniq
+
+
 def nick_exclude_hit(nick):
     """昵称是否该排除；命中则返回原因（词/号/牌:xxx），否则 None。"""
     n = norm_name(nick)
@@ -654,6 +849,19 @@ def main():
 
         page.on("response", on_response)
 
+        # 记录 search_feed_author 的**请求 payload** —— 用来做「筛选是否真生效」的端到端校验。
+        # （之前只看 UI 日志，粉丝量静默失效了一整批才发现，见 apply_formitem 的坑）
+        reqs = []
+
+        def on_request(req):
+            try:
+                if "search_feed_author" in req.url and req.method == "POST":
+                    reqs.append(req.post_data or "")
+            except Exception:
+                pass
+
+        page.on("request", on_request)
+
         # ---------- 交互工具 ----------
         def click_box(b, tag=""):
             page.mouse.click(b["x"] + b["w"] / 2.0, b["y"] + b["h"] / 2.0)
@@ -662,44 +870,159 @@ def main():
         def dropdown():
             return page.evaluate(DROPDOWN_JS)
 
+        def all_dropdowns():
+            try:
+                return page.evaluate(ALL_DROPDOWNS_JS) or []
+            except Exception:
+                return []
+
+        def close_dropdowns(max_round=3):
+            """把所有可见下拉关干净，返回是否已关干净。
+
+            🔴 坑（2026-09-17 实跑踩到，导致「粉丝量」筛选静默失效）：
+              auxo 的**多选**下拉按 Escape **关不掉**，会一直浮在页面下方。
+              而「粉丝量」正好排在「直播结算总额」**正下方**（x 相同 752、y 差 40）：
+                直播结算总额 item: x752~880 y359~384
+                粉丝量       item: x752~838 y399~424
+                结算下拉浮层     : x752~901 y388~629   <- 把粉丝量整个盖住
+              于是鼠标点「粉丝量」中心 (795,411) 落在浮层里被吞掉 -> 它的下拉从没打开
+              -> 读到的还是结算的下拉 -> 「下拉里没有 10w以下」连试 3 次全败。
+              （旧口径点「结算总额」浮层是 x644~793，粉丝量中心 x795 刚好超出 2px，
+                所以侥幸能点到 —— 这次换成「直播结算总额」才暴露。）
+            """
+            for _ in range(max_round):
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                time.sleep(0.3)
+                if not all_dropdowns():
+                    return True
+                try:
+                    if not page.evaluate(CLOSE_DROPDOWN_JS):
+                        return True
+                except Exception:
+                    pass
+                time.sleep(0.3)
+            return not all_dropdowns()
+
+        def pick_option(dds, option, item_box):
+            """在所有可见下拉里找 option；优先「几何上就在被点项正下方」的那个下拉。
+
+            不能无脑取 dds[-1]：多个浮层同时存在时那个可能属于别的字段。
+            """
+            cands = []
+            for d in dds:
+                it = next((i for i in d["items"] if i["t"] == option), None)
+                if not it:
+                    it = next((i for i in d["items"] if option in i["t"]), None)
+                if not it:
+                    continue
+                b = d["box"]
+                dy = abs(b["y"] - (item_box["y"] + item_box["h"]))
+                aligned = (b["x"] <= item_box["x"] + item_box["w"]
+                           and b["x"] + b["w"] >= item_box["x"])
+                cands.append((0 if aligned else 1, dy, it))
+            if not cands:
+                return None
+            cands.sort(key=lambda t: (t[0], t[1]))
+            return cands[0][2]
+
         def apply_formitem(name, option, tag):
-            """点击 form-item，若弹出下拉则选 option"""
+            """点击 form-item，若弹出下拉则选 option。"""
             for attempt in range(3):
-                page.keyboard.press("Escape")
-                time.sleep(0.5)
+                # 1) 先把残留浮层清干净（否则浮层会盖住下一行的筛选项）
+                if not close_dropdowns():
+                    log("  [%s] 警告：仍有下拉没关掉，继续尝试" % tag)
                 box = page.evaluate(FIND_FORMITEM_JS, name)
                 if not box:
                     log("  [%s] 未找到筛选项 %s" % (tag, name))
                     time.sleep(1.0)
                     continue
                 click_box(box)
-                dd = dropdown()
-                if not dd or not dd["items"]:
+                dds = all_dropdowns()
+                if not dds or not any(d["items"] for d in dds):
                     # 无下拉 => 开关型，点击即生效
                     log("  [%s] %s -> 直接切换 OK" % (tag, name))
                     return True
                 log("  [%s] %s 下拉选项: %s" % (
-                    tag, name, " | ".join(i["t"] for i in dd["items"])))
+                    tag, name, " | ".join(i["t"] for d in dds for i in d["items"])))
                 if option is None:
-                    page.keyboard.press("Escape")
-                    time.sleep(0.5)
+                    close_dropdowns()
                     log("  [%s] %s -> 无目标选项，跳过" % (tag, name))
                     return True
-                hit = next((i for i in dd["items"] if i["t"] == option), None)
+                hit = pick_option(dds, option, box)
                 if not hit:
-                    hit = next((i for i in dd["items"] if option in i["t"]), None)
+                    # 大概率是点击被浮层吞了 -> 用 JS 直接触发一次，再找
+                    log("  [%s] 可见下拉里没有 %s，改用 JS 直接点击该项重试" % (tag, option))
+                    close_dropdowns()
+                    try:
+                        page.evaluate(CLICK_FORMITEM_JS, name)
+                    except Exception as e:
+                        log("  [%s] JS 点击失败: %s" % (tag, str(e)[:60]))
+                    time.sleep(1.6)
+                    dds = all_dropdowns()
+                    hit = pick_option(dds, option, box)
                 if not hit:
-                    log("  [%s] 下拉里没有 %s" % (tag, option))
-                    page.keyboard.press("Escape")
-                    time.sleep(0.8)
+                    log("  [%s] 还是找不到 %s；当前可见下拉=%s" % (
+                        tag, option, [[i["t"] for i in d["items"]] for d in dds]))
+                    close_dropdowns()
+                    time.sleep(0.6)
                     continue
                 click_box(hit)
-                page.keyboard.press("Escape")
-                time.sleep(0.8)
-                now = page.evaluate(FIND_FORMITEM_JS, name)
-                log("  [%s] %s -> %s OK" % (tag, name, option))
+                close_dropdowns()
+                shown = page.evaluate(FORMITEM_TEXT_JS, name)
+                log("  [%s] %s -> %s OK（回显: %s）" % (tag, name, option, shown))
                 return True
             return False
+
+        def _filt_bad(filt):
+            """检查一份 payload filters 是否满足当前全部筛选要求，返回问题列表。"""
+            bad = []
+            fld = SALE_FIELD_BY_LABEL.get(SALE_LABEL, SALE_LABEL)
+            want_sale = sorted(RANGE_VALUE[o] for o in
+                               [x.strip() for x in SALE_OPTION.split("|") if x.strip()]
+                               if o in RANGE_VALUE)
+            got_sale = sorted(str(x) for x in (filt.get(fld) or []))
+            if got_sale != want_sale:
+                bad.append("%s=%s(期望%s)" % (fld, got_sale, want_sale))
+            want_fans = RANGE_VALUE.get(FANS_OPTION)
+            got_fans = [str(x) for x in (filt.get(FANS_FIELD) or [])]
+            if got_fans != [want_fans]:
+                bad.append("%s=%s(期望['%s'])" % (FANS_FIELD, got_fans, want_fans))
+            if not filt.get(CONTACT_FIELD):
+                bad.append("%s=%s(期望非空)" % (CONTACT_FIELD, filt.get(CONTACT_FIELD)))
+            want_cate = CATE_ID_BY_NAME.get(CATE_PARENT)
+            got_cate = [str(x) for x in (filt.get(CATE_FIELD) or [])]
+            if want_cate and (not got_cate or got_cate[0] != want_cate):
+                bad.append("%s=%s(期望%s)" % (CATE_FIELD, got_cate, want_cate))
+            return bad
+
+        def verify_filters():
+            """用接口 payload 端到端校验筛选是否真的生效 —— 最可靠的校验。
+
+            UI 上「选没选中」看不出来，但发出去的 filters 不会骗人。
+            只要有任意一条请求满足全部条件就算通过。
+            """
+            last = None
+            for q in reversed(reqs):
+                try:
+                    j = json.loads(q)
+                except Exception:
+                    continue
+                f = j.get("filters")
+                if isinstance(f, dict) and f:
+                    last = f
+                    if not _filt_bad(f):
+                        log("  [verify] 接口校验通过：%s" % json.dumps(
+                            {k: v for k, v in f.items() if v}, ensure_ascii=False)[:220])
+                        return []
+            if last is None:
+                return ["没抓到带 filters 的 search_feed_author 请求"]
+            bad = _filt_bad(last)
+            log("  [verify] 最近一次 payload filters=%s" % json.dumps(
+                {k: v for k, v in last.items() if v}, ensure_ascii=False)[:260])
+            return bad
 
         def apply_cate_cascade(parent, child):
             """规则1：点开父类目的级联面板 -> 选中子类目（如 个护家清 > 个人护理）。"""
@@ -952,12 +1275,45 @@ def main():
             sys.exit(2)          # 退出码 2 = 类目没选中（驱动层可重试）
         # 用户 2026-09-16 改：结算总额 -> **直播结算总额 = 1w-10w**
         # 字段 common_range_selection_live_sales_30d_settle（只认直播带货的结算额）。
-        # 单一选项，单选即可（该下拉支持多选，需要时可用逗号分隔传多个选项）。
+        # 单一选项，单选即可；要拼多档用 `|` 分隔（该下拉支持多选）。
+        ok_sale = True
         for _opt in [o.strip() for o in SALE_OPTION.split("|") if o.strip()]:
-            apply_formitem(SALE_LABEL, _opt, "sale")
-        apply_formitem("粉丝量", "10w以下", "fans")
-        apply_formitem("有联系方式", None, "contact")
+            ok_sale = apply_formitem(SALE_LABEL, _opt, "sale") and ok_sale
+        ok_fans = apply_formitem(FANS_LABEL, FANS_OPTION, "fans")
+        ok_contact = apply_formitem("有联系方式", None, "contact")
         time.sleep(4)
+
+        # 🔴 筛选项只要有一个没应用成功，就**直接中止**，绝不继续采。
+        #    踩过（2026-09-17）：「粉丝量」的点击被上一个字段的下拉浮层盖住，
+        #    3 次尝试全失败，但脚本照样跑完，采出一批**没有粉丝量约束**的名单。
+        if not (ok_sale and ok_fans and ok_contact):
+            log("!! 筛选应用失败（sale=%s fans=%s contact=%s）-> 中止本次采集"
+                % (ok_sale, ok_fans, ok_contact))
+            try:
+                page.screenshot(path=os.path.join(OUT, "filter_fail.png"))
+            except Exception:
+                pass
+            time.sleep(2)
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            sys.exit(2)
+
+        # 再用接口 payload 复核一次（UI 说成功不代表真的生效）
+        bad = verify_filters()
+        if bad:
+            log("!! 接口校验：筛选未生效 %s -> 中止本次采集（避免采到错误名单）" % bad)
+            try:
+                page.screenshot(path=os.path.join(OUT, "filter_fail.png"))
+            except Exception:
+                pass
+            time.sleep(2)
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            sys.exit(2)
 
         # 筛选回显
         try:
@@ -1171,8 +1527,10 @@ def main():
         # ---------- 本地过滤 ----------
         seen, picked = set(), []
         stat = {"dup": 0, "male": 0, "region": 0, "noprov": 0, "nocate": 0,
-                "catecombo": 0, "content": 0, "nickkw": 0, "nickbrand": 0}
+                "catecombo": 0, "content": 0, "contentkeep": 0,
+                "nickkw": 0, "nickbrand": 0}
         nick_drop = []                  # 记录被昵称规则剔除的样本，便于核对
+        content_drop = []               # 记录被内容类型剔除的样本（新规则上线后要能核对）
         for r in rows:
             k = norm_name(r["nickname"])
             if not k or k in seen:
@@ -1197,10 +1555,16 @@ def main():
                 stat[why] += 1
                 continue
             r["cate_hits"] = cate_hits
-            # 规则6：达人内容类型不得命中排除表
+            # 规则6：内容类型 —— **白名单优先**（用户 2026-09-17 改）
+            #   命中 CONTENT_KEEP 任一项 -> 直接保留，不再看黑名单。
+            #   例：「时尚+美食」以前被「美食」误杀，现在因为含「时尚」而保留。
             ct = r.get("content_type") or []
-            if any(c in CONTENT_EXCLUDE for c in ct):
+            if any(c in CONTENT_KEEP for c in ct):
+                stat["contentkeep"] += 1
+            elif any(c in CONTENT_EXCLUDE for c in ct):
                 stat["content"] += 1
+                if len(content_drop) < 40:
+                    content_drop.append("%s(%s)" % ((r["nickname"] or "")[:14], "/".join(ct)))
                 continue
             # 规则7：昵称命中渠道词 / 品牌号特征 / 品牌词表 -> 排除
             hit = nick_exclude_hit(r["nickname"])
@@ -1220,8 +1584,12 @@ def main():
                 stat["dup"], stat["male"], stat["region"], stat["noprov"],
                 stat["nocate"], stat["catecombo"], stat["content"],
                 stat["nickkw"], stat["nickbrand"], len(picked)))
+        log("  内容类型白名单（%s）另有 %d 个达人被明确保留"
+            % ("/".join(CONTENT_KEEP), stat["contentkeep"]))
         if nick_drop:
             log("  昵称被剔除样本：%s" % " | ".join(nick_drop))
+        if content_drop:
+            log("  内容类型被剔除样本：%s" % " | ".join(content_drop))
 
         picked = picked[:MAX_CANDIDATE]
         log("  候选池 %d 个达人" % len(picked))
@@ -1314,7 +1682,7 @@ def main():
                                 if prows:
                                     break
                                 time.sleep(2.2)
-                            # 规则3b：带货商品名命中禁忌词（假发/院线/美甲）-> 跳过
+                            # 规则3b：带货商品名命中禁忌词（假发/院线/美甲/充电宝/3C数码…）-> 跳过
                             titles = [(x.get("title") or "").strip() for x in prows]
                             bad_kw = product_exclude_hit(titles)
                             if bad_kw:
@@ -1335,10 +1703,43 @@ def main():
                                 r["shop_rows"] = total
                                 r["top_brand"] = brand
                                 r["top_brand_ratio"] = round(ratio, 3)
+                                # --- 规则3d：低价铺货型（>=90% 商品 < 30 元）---
+                                cskip, cratio, cn_ok, cn_all, cwhy = cheap_verdict(prows)
+                                r["price_cheap_ratio"] = round(cratio, 3)
+                                r["price_n"] = cn_ok
+                                r["price_rows"] = cn_all
                                 log("   [%d/%d] %-20s 带货 %d 件，最大品牌「%s」%d 件占 %.0f%% "
                                     "（Top3: %s）" % (
                                         i, cand_n, nick18, total, brand, top_cnt, ratio * 100,
                                         " / ".join("%s×%d" % (g[0], g[1]) for g in grp)))
+                                log("   [%d/%d] %-20s 到手价：%d/%d 件可解析，<%.0f元 占 %.0f%%" % (
+                                    i, cand_n, nick18, cn_ok, cn_all, CHEAP_PRICE, cratio * 100))
+                                if cwhy == "fewprice":
+                                    r["skip_reason"] = "价格样本不足·未判定(%d/%d)" % (cn_ok, cn_all)
+                                    verdict_cache[r["uid"]] = "skip"
+                                    log("   [%d/%d] %-20s ! 到手价只解析出 %d/%d 件"
+                                        " -> 未判定，跳过该达人（不进入查微信）" % (
+                                            i, cand_n, nick18, cn_ok, cn_all))
+                                    break
+                                if cskip:
+                                    r["skip_reason"] = "低价铺货%.0f%%<%.0f元" % (cratio * 100, CHEAP_PRICE)
+                                    verdict_cache[r["uid"]] = "skip"
+                                    log("   [%d/%d] %-20s %.0f%% 的商品到手价 < %.0f 元"
+                                        " (>=%.0f%%) -> 跳过该达人" % (
+                                            i, cand_n, nick18, cratio * 100, CHEAP_PRICE,
+                                            CHEAP_RATIO * 100))
+                                    break
+                                # --- 规则3c：去重店铺家数 <= 2 -> 跳过（专卖自己店的达人）---
+                                sskip, scnt, slist = shopcnt_verdict(shops)
+                                r["shop_cnt"] = scnt
+                                if sskip:
+                                    r["skip_reason"] = "带货店铺仅%d家" % scnt
+                                    verdict_cache[r["uid"]] = "skip"
+                                    log("   [%d/%d] %-20s 带货店铺仅 %d 家（<=%d）%s"
+                                        " -> 跳过该达人" % (
+                                            i, cand_n, nick18, scnt, MIN_SHOP_CNT,
+                                            "：" + "/".join(slist[:3])))
+                                    break
                                 if skip:
                                     r["skip_reason"] = "带货同源%.0f%%:%s" % (ratio * 100, brand)
                                     verdict_cache[r["uid"]] = "skip"
@@ -1357,8 +1758,9 @@ def main():
                                     log("   [%d/%d] %-20s 昵称含带货品牌「%s」-> 跳过" % (
                                         i, cand_n, nick18, bhit))
                                     break
-                                log("   [%d/%d] %-20s 多家品牌（最大仅 %.0f%%）"
-                                    " -> 继续查联系方式" % (i, cand_n, nick18, ratio * 100))
+                                log("   [%d/%d] %-20s 店铺 %d 家 / 多家品牌（最大仅 %.0f%%）"
+                                    " -> 继续查联系方式" % (
+                                        i, cand_n, nick18, scnt, ratio * 100))
                             else:
                                 # 用户要求：带货分析这一步必须真正执行 ——
                                 # 拿不到商品数据就无法判定，不能直接进入下一步，只能换人
@@ -1452,12 +1854,24 @@ def main():
             if got_val:
                 valid_n += 1
             done.append(r)
-            tail = "跳过·带货同源" if r.get("skip_reason") else (got_val or "✗ 未取到")
+            tail = ("跳过·" + r["skip_reason"]) if r.get("skip_reason") else (got_val or "✗ 未取到")
             log("   [%d/%d] %-22s %-12s 粉丝=%-7s %s=%s  (有效 %d/%d)" % (
                 i, cand_n, (r["nickname"] or "")[:20], r["city"], r["fans"],
                 got_type or "联系", tail, valid_n, TARGET_DAREN))
 
         picked = done
+
+        # ---------- 带货规则跳过原因汇总（用户 2026-09-17 新增三条规则后要能一眼核对） ----------
+        sk = {}
+        for r in picked:
+            sr = r.get("skip_reason") or ""
+            if not sr:
+                continue
+            head = sr.split(":")[0].split("%")[0].split("(")[0]
+            sk[head] = sk.get(head, 0) + 1
+        if sk:
+            log("  带货规则跳过汇总：" + " / ".join(
+                "%s=%d" % (k, v) for k, v in sorted(sk.items(), key=lambda x: -x[1])))
 
         # ---------- 输出 ----------
         # 覆盖前先归档上一版，避免小批量测试把正式名单冲掉

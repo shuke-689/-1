@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
-"""双类目采集驱动：15 个「个护家清」 + 15 个「美妆」，合并成一份名单。
+"""双类目采集驱动：每批采集「个护家清」+「美妆」两个类目的达人，合并成一份名单。
 
 为什么分两批：
   精选联盟的「主推类目」筛选是级联选择，一次只能选一个大类；
-  按类目分批跑 collect.py（每批独立设 TARGET_DAREN=15），最后按 uid 去重合并。
+  按类目分批跑 collect.py（每批独立设 TARGET_DAREN），最后按 uid 去重合并。
+
+采集深度（用户 2026-09-17 改「看更深一些」）：
+  之前每批只取 15 个有效达人就停，候选池里靠后的大量达人**根本没被检查**，
+  用户反映「有很多时尚的、符合类目的，未筛选到」。
+  现改为每批 **GHQ_TARGET/MZ_TARGET（默认 30）**，即大约要看 40-60 个候选达人，
+  耗时和平台请求都接近翻倍。想回到原来的浅采集：`GHQ_TARGET=15 MZ_TARGET=15`。
 
 限流（重要）：
   抖音精进联盟的 square_pc_api 请求过密会返回
@@ -17,8 +23,8 @@
 用法：
   python collect_30.py
 环境变量：
-  GHQ_TARGET  个护家清目标数（默认 15）
-  MZ_TARGET   美妆目标数（默认 15）
+  GHQ_TARGET  个护家清目标有效达人数（默认 30）
+  MZ_TARGET   美妆目标有效达人数（默认 30）
   BATCH_COOLDOWN  批次间冷却秒数（默认 300）
   MAX_RETRY       单批限流重试次数（默认 3）
   MAX_SCROLL / MAX_CANDIDATE / SAME_BRAND_RATIO / DAREN_PAUSE 透传给 collect.py
@@ -44,8 +50,8 @@ LOG = os.path.join(BASE, "out", "collect_30.log")
 os.makedirs(OUT, exist_ok=True)
 
 JOBS = [
-    ("个护家清", "ghq", int(os.environ.get("GHQ_TARGET", "15"))),
-    ("美妆", "mz", int(os.environ.get("MZ_TARGET", "15"))),
+    ("个护家清", "ghq", int(os.environ.get("GHQ_TARGET", "30"))),
+    ("美妆", "mz", int(os.environ.get("MZ_TARGET", "30"))),
 ]
 BATCH_COOLDOWN = int(os.environ.get("BATCH_COOLDOWN", "300"))
 MAX_RETRY = int(os.environ.get("MAX_RETRY", "3"))
