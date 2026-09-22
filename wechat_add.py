@@ -541,11 +541,34 @@ def _drop_nick_excluded(cand):
     return keep, out
 
 
+# 【手机号达人】2026-09-22 新增：`contact_type == "手机"` 的候选人**默认跳过**。
+#   实测台账里手机号 **23/23 全部 not_found**（微信不支持按手机号精确搜好友），
+#   而且飞书只登记微信号（`feishu_sync` 只收 `contact_type == "微信"`）——
+#   跑它们是纯浪费（每个约 10 秒）并污染 not_found 统计。
+#   想照旧硬试：`SKIP_PHONE=0`。
+SKIP_PHONE = os.environ.get("SKIP_PHONE", "1").lower() not in ("0", "false", "no", "off", "")
+
+
+def _drop_phone(cand):
+    """把手机号候选人剔除，返回 (保留, [昵称...])。`SKIP_PHONE=0` 时原样返回。"""
+    if not SKIP_PHONE:
+        return cand, []
+    keep = [d for d in cand if (d.get("contact_type") or "") != "手机"]
+    out = [d.get("nickname") or "" for d in cand
+           if (d.get("contact_type") or "") == "手机"]
+    return keep, out
+
+
 def run(limit=0, dry=False):
     open(LOG, "w", encoding="utf-8").close()
     src = json.load(open(os.path.join(BASE, "out", "collect", "darens.json"), encoding="utf-8"))
     ledger = load_ledger()
     cand = [d for d in src if d.get("contact")]
+    # 手机号达人默认跳过（见 _drop_phone 注释；SKIP_PHONE=0 可关）
+    cand, phone_out = _drop_phone(cand)
+    if phone_out:
+        log("跳过 %d 个手机号达人（手机号一律搜不到、飞书也只登微信号）：%s" % (
+            len(phone_out), " | ".join(n[:14] for n in phone_out[:8])))
     # 【规则7 复核】昵称命中排除词的直接丢掉 ——
     #   词表可能是在 A 阶段跑完之后才追加的（如 2026-09-17 加的那 10 个），
     #   旧名单不会自动重筛，所以 B 阶段必须再用**现行**词表挡一道，
@@ -676,6 +699,8 @@ def status():
     src = json.load(open(os.path.join(BASE, "out", "collect", "darens.json"), encoding="utf-8"))
     ledger = load_ledger()
     cand = [d for d in src if d.get("contact")]
+    # 与 run() 保持一致：手机号默认跳过
+    cand, phone_out = _drop_phone(cand)
     # 与 run() 保持一致：先过一遍规则7，否则 status 会列出**实际不会加**的人
     # （曾出现「status 说待加 25 个，run 只加 22 个」的迷惑现象）
     cand, nick_out = _drop_nick_excluded(cand)
@@ -683,6 +708,8 @@ def status():
             not in DONE_STATUS]
     from collections import Counter
     log("候选达人 %d 个 / 台账 %d 条 / 剩余待加 %d 个" % (len(cand), len(ledger), len(left)))
+    if phone_out:
+        log("（另有 %d 个手机号达人默认不计入待加，如需硬试：SKIP_PHONE=0）" % len(phone_out))
     if nick_out:
         log("（另有 %d 个因昵称命中排除词不计入待加：%s）" % (
             len(nick_out), " | ".join("%s(%s)" % (n[:14], h) for n, h in nick_out[:10])))
