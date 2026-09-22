@@ -32,8 +32,10 @@
           起因：平台侧筛出来的 156 条里有 16 条实际不在 1w-10w，
           其中 settle_live=0-0 的会污染飞书登记表（显示「结算总额 0-0」）。
           可关：LOCAL_SETTLE_FILTER=0
-  粉丝量 = 10w以下
-  有联系方式 = 勾选
+  粉丝量 = 10w以下（⚠️ 2026-09-22 已从平台侧移除，改由本地**规则2d** 兜底）
+  有联系方式 = 勾选（2026-09-22 晚**加回**；不加则每个候选都要开主页，微信率 13% -> 48%~57%）
+  ⚠️ 平台侧现行共四项：主推类目(级联) + 内容类型(13项) + 直播结算总额 + 有联系方式。
+     口径的**唯一权威版本在 RUNBOOK.md §1.6**，本文件 docstring 只写要点。
 本地过滤：
   性别 = 女(gender==2)
   排除地区：海南 / 新疆 / 西藏 / 境外
@@ -320,21 +322,38 @@ SALE_FIELD_BY_LABEL = {
     "橱窗结算总额": "common_range_selection_window_sales_30d_settle",
 }
 # ===========================================================================
-# 【平台侧筛选】2026-09-22 用户改口径：**只保留三项**
+# 【平台侧筛选】现行口径 —— 2026-09-22 晚：**平台侧共四项**
 #   ① 主推类目   —— 级联：个护家清 > 个人护理 ／ 美妆 > 不限
 #   ② 内容类型   —— 先在 form-item 右侧点「展开」，再点选 13 个 chip
 #   ③ 直播结算总额 = 1w-10w
-#   （原话：「A阶段平台侧筛选全部清除，按照图中两种进行筛选……」）
+#   ④ 有联系方式 —— 开关型 form-item，点一下就勾上（2026-09-22 晚用户要求**加回**）
 #
-# 🔴 以下平台筛选项已**整体移除**（原代码保留在 git 历史里）：
+# 🔴 为什么④必须留着（实测数据，别再手滑删掉）：
+#    平台侧**没有**「有联系方式」时，每个候选都得开一次主页才知道有没有微信号 ——
+#      09-22 16:04 那轮（无该项）：处理 122 个，「主页无联系方式行」40 个(33%)，微信率仅 13%；
+#      09-20 / 09-21 两轮（有该项）：无联系方式行 0 个，微信率 48% ~ 57%。
+#    即：加回④ ≈ 微信率 ×4，并直接消灭用户看到的「详情页下方一片空白」的无效轮次。
+# ⚠️ ④**无本地兜底**（这个字段只有平台侧给得出来）：
+#    · 列表接口不返回联系人 —— `a.get("has_contact")` 实测**恒为 None**（217 条全 None）；
+#      样例 item 里只有 author_contact{phone,wechat,lark,douyin}，实测**四个都是空串**。
+#    · 所以「取不到 = 剔除」那种兜底写法在这一项上做不了，只能靠平台侧筛 + 逐主页确认。
+#    · 好在这个字段**只要缺失也只会变慢、不会变脏**（无联系方式的达人在主页那一步会被
+#      本地判成「未取到」而不计入有效）-> 见 _filt_bad 里对它的**软校验**。
+#
+# 🔴 以下平台筛选项已**整体移除**（原实现保留在 git 历史里）：
 #   · 「粉丝量」/「粉丝指数」10w以下  -> 本地**规则2d** 兜底（FANS_MAX，取不到=剔除）
 #   · 「达人画像 > 达人性别 = 女」     -> 本地 `gender != 2` 本来就剔（规则在过滤循环里）
 #   · 「粉丝画像 > 粉丝性别 = 女性居多」-> **无本地兜底**，清掉后不再限制
-#   · 「有联系方式」                  -> 🔴 **无本地兜底**：只有平台侧能给这个字段。
-#        清掉它 A 会明显变慢 —— 每个候选都要开一次主页才知道有没有联系方式。
-#        要恢复：export PLATFORM_EXTRA_FILTER=1（见文件末「恢复旧平台筛选」注释块）
-FANS_FIELD = "fans_num"              # 仅用于文档/排错对照，平台侧不再筛
-CONTACT_FIELD = "has_contact"        # 同上
+#        这三项要恢复：apply_agg() 仍保留，照着 git 历史里的调用处放回即可。
+FANS_FIELD = "fans_num"              # 仅用于文档/排错对照（平台侧筛「粉丝指数」，payload 字段名没变）
+CONTACT_FIELD = "has_contact"        # 平台侧「有联系方式」在 payload 里的键（实测 09-22 仍是此名）
+
+# 【有联系方式】2026-09-22 22:0x 用户要求加回（原话：「在A阶段添加规则，选择有联系方式」）
+#   改文案/改名时：export CONTACT_LABEL="新名"
+#   临时关掉：export PLATFORM_CONTACT_FILTER=0
+CONTACT_LABEL = os.environ.get("CONTACT_LABEL", "有联系方式")
+PLATFORM_CONTACT_FILTER = os.environ.get(
+    "PLATFORM_CONTACT_FILTER", "1").lower() not in ("0", "false", "no", "off", "")
 CATE_FIELD = "main_cate_new"
 # 子类目落在另一个字段上（2026-09-22 探针实测）：
 #   选「个护家清 > 个人护理」-> payload 同时带
@@ -358,11 +377,12 @@ CONTENT_TYPES = tuple(x.strip() for x in os.environ.get(
 ).split(",") if x.strip())
 
 # 【已移除·2026-09-22】达人画像(达人性别=女) / 粉丝画像(粉丝性别=女性居多) 两项平台筛选
-#   —— 用户要求平台侧只留三项，这两项整体下架。
+#   —— 平台的 agg 类筛选项整体下架（同批下架的「粉丝量」后来也没回来；但
+#      「有联系方式」在 09-22 晚被用户要求加回了，见上方 CONTACT_* 常量）。
 #   达人性别仍有本地兜底（过滤循环里 `str(r["gender"]) != "2"` 直接剔）；
 #   粉丝性别**无本地兜底**（数据里没有对应字段），清掉后不再限制。
 #   原实现（apply_agg 三步走 + 常量 PORTRAIT_*/FANS_GENDER_*）见 git 历史；
-#   要恢复：export PLATFORM_EXTRA_FILTER=1（见 apply_agg 定义处的注释）。
+#   要恢复：apply_agg() 函数本身**仍保留**，照 git 历史里的调用处放回即可。
 # 达人画像/粉丝画像是 agg 面板（.quick-filter-button-agg-pop），交互三步：
 #   ① 点该行的「请选择」 ② 点选项 ③ 点面板内「确认」。apply_agg() 仍保留给恢复路径用。
 
@@ -1357,6 +1377,11 @@ def main():
         # 记录 search_feed_author 的**请求 payload** —— 用来做「筛选是否真生效」的端到端校验。
         # （之前只看 UI 日志，粉丝量静默失效了一整批才发现，见 apply_formitem 的坑）
         reqs = []
+        # 「有联系方式」的**软校验**状态（软 = 只写日志、不进 _filt_bad 的 bad 列表）。
+        #   理由：该项失效只会让候选变多、变慢，不会让名单变脏 ——
+        #   无联系方式的达人在主页那一步就会被本地判成「未取到」而不计入有效。
+        #   反过来，把它当硬校验会让退出码 2 连带丢掉整批成果，代价不对称。
+        contact_soft = {"applied": False, "hit": False, "warned": False}
 
         def on_request(req):
             try:
@@ -1579,11 +1604,37 @@ def main():
                 return True
             return False
 
+        def apply_contact_filter():
+            """勾选平台侧「有联系方式」（开关型 form-item，没有下拉，点一下即生效）。
+
+            2026-09-22 晚用户要求加回。不加的话每个候选都要开一次主页才知道有没有微信号：
+            实测微信率 13%（带该项的 09-20/09-21 两轮是 48%~57%），而且会大量产出
+            「达人详情页下方一片空白」的无效轮次（用户 09-22 截图反馈的就是这种页面）。
+
+            ⚠️ **软失败**：页面上找不到该筛选项时，记日志后照常继续跑，不中止本批。
+               少筛一项只会变慢（本地主页那步会剔掉），不会采错；
+               而中止会连带丢掉整批成果 —— 代价不对称，所以不硬失败。
+               点了却「没生效」的情况由 _filt_bad 的软校验负责打日志。
+            """
+            if not PLATFORM_CONTACT_FILTER:
+                log("应用筛选：**平台侧不筛有联系方式**（PLATFORM_CONTACT_FILTER=0）"
+                    "-> 每个候选都会开一次主页才能确认")
+                return True
+            if not page.evaluate(FIND_FORMITEM_JS, CONTACT_LABEL):
+                log("  [contact] !! 未找到「%s」筛选项 -> 本次跳过该项"
+                    "（照旧逐个开主页确认，会更慢）" % CONTACT_LABEL)
+                return False
+            ok = apply_formitem(CONTACT_LABEL, None, "contact")
+            contact_soft["applied"] = ok
+            return ok
+
         def _filt_bad(filt):
             """检查一份 payload filters 是否满足当前全部筛选要求，返回问题列表。
 
-            2026-09-22 口径变更后**只校验三项**：结算额 + 主推类目(含子类目) + 内容类型。
-            （粉丝量/有联系方式/达人画像/粉丝画像 已从平台侧整体移除，不再校验。）
+            2026-09-22 口径变更后**硬校验三项**：结算额 + 主推类目(含子类目) + 内容类型。
+            「有联系方式」只做**软校验**（见下 ④）：失效只影响速度不影响名单正确性，
+            所以只打一次日志提醒，**不**写进 bad（写进去会触发退出码 2 丢掉整批）。
+            （粉丝量/达人画像/粉丝画像 已从平台侧整体移除，不再校验。）
             """
             bad = []
             # ① 直播结算总额 = 1w-10w
@@ -1613,6 +1664,17 @@ def main():
                     bad.append("%s 缺 %d 项:%s(实际 %d 项)"
                                % (CONTENT_TYPE_FIELD, len(miss), "/".join(miss[:6]),
                                   len(got_ct)))
+            # ④ 有联系方式（**软**：只提示，不进 bad）
+            #    只要有一份 payload 带上了 has_contact 就算生效；全部都没有才提示一次。
+            if PLATFORM_CONTACT_FILTER and contact_soft["applied"] and not contact_soft["hit"]:
+                got_c = [str(x) for x in (filt.get(CONTACT_FIELD) or [])]
+                if got_c:
+                    contact_soft["hit"] = True
+                    log("  [contact] payload 校验通过：%s=%s" % (CONTACT_FIELD, got_c))
+                elif not contact_soft["warned"]:
+                    contact_soft["warned"] = True
+                    log("  [contact] !! payload 里没有 %s -> 该项可能没生效；"
+                        "候选会混进无联系方式的达人（本地会剔掉，只是更慢）" % CONTACT_FIELD)
             return bad
 
         def verify_filters():
@@ -1930,8 +1992,8 @@ def main():
             sys.exit(3)          # 退出码 3 = 一直没登录上（驱动层应整体中止）
         log("登录态正常：%s" % login_why)
 
-        # 🔴 2026-09-22 平台侧只剩三项：结算额 + 主推类目(级联) + 内容类型。
-        #    其余（粉丝量/有联系方式/达人画像/粉丝画像）已整体移除，见文件上方常量注释。
+        # 🔴 2026-09-22 晚 平台侧**四项**：结算额 + 内容类型 + 主推类目(级联) + 有联系方式。
+        #    其余（粉丝量/达人画像/粉丝画像）已整体移除，见文件上方常量注释。
         #
         # ① 直播结算总额 = 1w-10w
         #    用户 2026-09-16 改：结算总额 -> 直播结算总额。
@@ -1967,11 +2029,22 @@ def main():
         else:
             log("应用筛选：**平台侧不筛类目**（PLATFORM_CATE_FILTER=0）"
                 "-> 类目由本地规则4 按达人列表里的类目标签把关")
+
+        # ④ 有联系方式（开关型：点一下即勾选，没有下拉，不会留浮层）
+        #    用户 2026-09-22 晚要求加回 —— 不加则每个候选都要开一次主页，
+        #    实测微信率 13% vs 带该项的 48%~57%，且会产出大量「详情页下方空白」。
+        #    ⚠️ 软失败：找不到筛选项只记日志，**不进 ok_* 三兄弟、也不中止本批**。
+        ok_contact = apply_contact_filter()
+        if not ok_contact and PLATFORM_CONTACT_FILTER:
+            log("  [contact] 该项未生效 -> 候选里会混进没有联系方式的达人"
+                "（本地逐主页确认时会剔掉，只是更慢）")
         time.sleep(4)
 
         # 🔴 筛选项只要有一个没应用成功，就**直接中止**，绝不继续采。
         #    踩过（2026-09-17）：「粉丝量」的点击被上一个字段的下拉浮层盖住，
         #    3 次尝试全失败，但脚本照样跑完，采出一批**没有粉丝量约束**的名单。
+        #    ⚠️ 唯独「有联系方式」**不在**这个中止条件里（ok_contact 故意没放进来）：
+        #       它失效只会变慢、不会变脏，硬中止会连带丢掉整批成果，代价不对称。
         if not (ok_sale and ok_ct and cate_ok):
             log("!! 筛选应用失败（sale=%s ctype=%s cate=%s）-> 中止本次采集"
                 % (ok_sale, ok_ct, cate_ok))
@@ -2002,6 +2075,9 @@ def main():
             sys.exit(2)
 
         # 筛选回显
+        #   ⚠️ 这里原来只打前 20 个 —— 但「内容类型 / 主推类目 / 有联系方式」正好排在
+        #   20 名之后（结算额的各种区间占了前 15 个），等于**什么都没看到**。
+        #   09-22 排「有联系方式」存不存在时就被这个截断坑了一次 -> 放宽到 60 并打总数。
         try:
             applied = page.evaluate("""() => {
                 const out = [];
@@ -2009,9 +2085,10 @@ def main():
                     const t = (e.innerText||'').trim();
                     if (t && t.length < 30) out.push(t);
                 });
-                return out.slice(0, 20);
+                return {n: out.length, items: out.slice(0, 60)};
             }""")
-            log("  筛选项当前显示: %s" % " , ".join(applied))
+            log("  筛选项当前显示（共 %d 项）: %s" % (
+                applied.get("n", 0), " , ".join(applied.get("items") or [])))
         except Exception:
             pass
 
