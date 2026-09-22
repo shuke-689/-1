@@ -50,6 +50,7 @@ export PATH="/c/Users/<你>/.workbuddy/binaries/PortableGit/versions/1.2.0/cmd:\
 | `tools/run_b_rounds.sh` | 阶段B 连跑（一直加到风控/候选加完），见 §3 |
 | `tools/collect_more.py` | **阶段A 多轮累积采集**：反复跑 `collect.py`，按「台账里没有的微信号」去重攒够 N 个，自动合并回 `darens.json`。见 §2.1 |
 | `tools/salvage_scan.py` | **候选池告急时的回收器**：扫 `out/collect/**/*.json`（含 `archive/`），捞出「有微信 + 不在台账 + 通过当前全部规则」的达人。`--merge` 直接并入名单（不重开浏览器）。见 RUNBOOK §3.2.2 |
+| `tools/merge_into_darens.py` | **把 `OUT_TAG` 跑出来的试跑/补采产物并进正式名单**（自动备份 + 按 uid 去重）。`--from <json> --only-with-contact [--dry]`。⚠️ 别手工拼 json，也别把 `darens_xxx.json` 改名冒充 `darens.json` |
 | `tools/z_recheck.py` | **Z 口径复核器**：用当前规则（Z 类目 + 3a/3b/3c/3d/**3f** + 规则7）重筛 `darens.json`。`--drop` 摘掉不合格项。**规则改动后、跑阶段B 前必做**。见 RUNBOOK §3.2.2 |
 | `tools/check_js.py` | 把 .py 里 Playwright 用的 JS 负载抠出来做 `node --check`，见 §7 |
 
@@ -520,6 +521,7 @@ B 拍到 Edge → 误判 `risk_control` 整轮中止 / `not_found` 永久跳过�
 | 微信结果页识别不了 | 可能是风控弹窗遮挡 → 查 `risk_control` |
 | 登记飞书报 `找不到 node(...) / run.js` | `lark-cli` 的 node 包没装好 → 见 RUNBOOK 3.7「两个必须知道的坑」 |
 | 飞书表里出现同名两行 / 该更新的没更新 | 幂等键是**达人名称**，改名就会新建行；确认 `--dry` 输出的待新增/待更新数 |
+| 🔴 每轮 `--dry` 都显示「待更新 1 条」，跑完还是 1 条、**永远收敛不了** | `darens.json` 里有**两个不同 uid、同一昵称**的达人（实测 2026-09-22「妮娜姐姐护肤实验室【筋膜提升】」粉丝 4275 / 4263）→ 同一 record_id 被塞进同一次批量更新两次，飞书该行在两值间**来回翻**。已修：`build_rows()` 按达人名称去重（**首个为准**），日志新增「同名合并 N」。看到该计数 >0 就是这种情况，属正常 |
 | 抖音号取回来看起来是别人的 | **串号 bug** → 看 RUNBOOK 3.8；日志应有「页面含该达人昵称=True」，为 False 就该怀疑 |
 | 抖音主页弹登录框挡事 | 已内置 `dismiss_popup()` 点 ✕；关不掉也不影响读顶部抖音号 |
 | 日志只有「检测到弹窗→点 X 关闭」紧跟「⚠️ 弹窗没关掉」，中间**没有**「点 X: tag=…」 | 关闭按钮**一个候选都没找到**（抖音 class 是哈希串，`[class*=close]` 无效）→ 已改几何法，见 RUNBOOK 3.8；同时看紧随其后的 `取证: {...}` dump |

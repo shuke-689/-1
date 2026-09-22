@@ -224,7 +224,13 @@ def build_rows(recs, ledger, all_rec, limit, keep_excluded=False):
     """
     rows = []
     stat = {"total": 0, "no_contact": 0, "已申请": 0, "添加失败": 0, "空": 0,
-            "无抖音号": 0, "昵称排除": 0}
+            "无抖音号": 0, "昵称排除": 0, "重名合并": 0}
+    # 幂等键 = 达人名称，所以**同名必须只出一行**。
+    #   实测 2026-09-22：darens.json 里有两条**不同 uid、同一昵称**
+    #   （「妮娜姐姐护肤实验室【筋膜提升】」4275 / 4263 粉丝），
+    #   不去重 -> 同一 record_id 被塞进同一次批量更新两次 ->
+    #   飞书里该行粉丝数在 4275/4263 之间**每轮来回翻**（永远收敛不了）。
+    seen_names = set()
     for r in recs:
         stat["total"] += 1
         if not all_rec and not r.get("contact"):
@@ -236,6 +242,10 @@ def build_rows(recs, ledger, all_rec, limit, keep_excluded=False):
         if not keep_excluded and nick_rules.nick_exclude_reason(name):
             stat["昵称排除"] += 1
             continue
+        if name in seen_names:
+            stat["重名合并"] += 1
+            continue
+        seen_names.add(name)
         led = ledger.get(r.get("uid")) or {}
         st = led.get("add_status") or ""
         f = {
@@ -418,10 +428,10 @@ def main():
 
     rows, stat = build_rows(recs, ledger, a.all, a.limit, a.include_excluded)
     log("将登记 %d 条（有效 %d；状态：已申请 %d、添加失败 %d、留空 %d；"
-        "无抖音号 %d；昵称命中排除词跳过 %d）" % (
+        "无抖音号 %d；昵称命中排除词跳过 %d；同名合并 %d）" % (
             len(rows), stat["total"] - stat["no_contact"], stat.get("已申请", 0),
             stat.get("添加失败", 0), stat.get("空", 0), stat["无抖音号"],
-            stat.get("昵称排除", 0)))
+            stat.get("昵称排除", 0), stat.get("重名合并", 0)))
     if not rows:
         log("没有可登记的行，结束")
         return

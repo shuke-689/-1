@@ -260,6 +260,15 @@ export BATCH_COOLDOWN=300 MAX_RETRY=3      # 批次冷却 + 限流重试
 > （2026-09-17 用户要求「看更深一些」：之前各 15，只看了 22/104 个候选就停，
 >  候选池靠后的达人根本没被检查）。想回到浅采集：`GHQ_TARGET=15 MZ_TARGET=15`。
 > `OUT_TAG` 给输出文件加后缀，避免分批跑互相覆盖。
+> ⚠️ 用 `OUT_TAG` 跑出来的 `darens_<tag>.json` 是**独立文件**，**不会**进正式名单
+> （这是刻意的：否则 `collect.py` 会把旧名单挪进 `archive/` 后用这一小批覆写）。
+> 要并进正式名单，用 **`tools/merge_into_darens.py`**（自动备份 + 按 uid 去重）：
+> ```bash
+> "$PY" tools/merge_into_darens.py --from out/collect/darens_try10.json --only-with-contact --dry
+> "$PY" tools/merge_into_darens.py --from out/collect/darens_try10.json --only-with-contact
+> ```
+> `--only-with-contact` 只收有联系方式的（阶段 B 用得上的）；后跑 `wechat_add.py status` 确认「剩余待加」。
+> **别手工拼 json** —— 也**别**拿带 tag 的产物直接改名成 `darens.json`。
 > **别连跑两批**——平台会返回 `11001 请求过于频繁`（见下文「平台限流」）。
 >
 > 诊断探针（在 `.probe/`）：
@@ -885,7 +894,7 @@ tools/run_b_rounds.sh 10 30 60               # LIMIT / MAX_ROUNDS / 轮间秒数
 
 | 飞书列 | 来源 | 说明 |
 |---|---|---|
-| 达人名称 | `darens.json[].nickname` | 幂等键（同名走 update，不重复建行） |
+| 达人名称 | `darens.json[].nickname` | 幂等键（同名走 update，不重复建行）。⚠️ 键是**昵称**，所以 `build_rows()` 会**按昵称去重（首个为准）**并打「同名合并 N」—— 2026-09-22 实测 `darens.json` 里有**两个不同 uid、同一昵称**的达人，不去重会让同一行粉丝数在两值之间**每轮来回翻**、永远收敛不了 |
 | 达人抖音号 | `darens.json[].douyin_id` | 见下方「取抖音号」 |
 | **达人微信号** | `darens.json[].contact`（`contact_type=微信` 时） | **2026-09-19 用户新增列**。只填**微信号**，手机号达人不填（与 Excel 登记表口径一致） |
 | 粉丝数 | `darens.json[].fans` | 数字列 |
