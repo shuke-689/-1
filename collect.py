@@ -217,6 +217,32 @@ def _settle_bounds():
 
 SETTLE_MIN, SETTLE_MAX = _settle_bounds()
 
+# ---- 规则2d：本地兜底过滤「粉丝量」（2026-09-22 新增，默认开）----------------
+# 为什么需要它：
+#   ① 平台侧「粉丝量」这个筛选项在 2026-09-22 被改名为「粉丝指数」（见 FANS_LABELS）；
+#      改名期间本地过滤里**完全没有**粉丝量这一关（`bad_fans()` 只是抽样统计、不拦数据），
+#      平台侧一旦没生效/没点到，就会把大号收进来。
+#   ② 与规则2b 同源的经验：**平台侧筛选不严格**（结算额实测漏出 ~10%），
+#      粉丝量同样不能只靠平台。
+# 口径：`fans > FANS_MAX` 剔除；**取不到数值 = 未判定 = 剔除**（沿用项目铁律）。
+# 关掉：LOCAL_FANS_FILTER=0；改上限：FANS_MAX=50000
+LOCAL_FANS_FILTER = os.environ.get("LOCAL_FANS_FILTER", "1").lower() not in (
+    "0", "false", "no", "off", "")
+FANS_MAX = int(os.environ.get("FANS_MAX", "100000"))
+
+
+def fans_ok(fans, hi=None):
+    """规则2d 判定：粉丝数是否 <= 上限。返回 (ok, note)。取不到一律判否。"""
+    b = FANS_MAX if hi is None else hi
+    try:
+        n = int(fans)
+    except Exception:
+        return False, "无数据(%s)" % fans
+    if n > b:
+        return False, "%s>%s" % (n, b)
+    return True, str(n)
+
+
 # ---- 规则2c：「未授权数据」达人按等级放行（2026-09-19 用户新增）----------------
 # 用户原话：「添加规则，如遇到未授权数据的达人，看达人名字后的等级，大于等于2的，
 #            则可以进行添加。」
@@ -293,7 +319,19 @@ SALE_FIELD_BY_LABEL = {
     "图文结算总额": "common_range_selection_picture_sales_30d_settle",
     "橱窗结算总额": "common_range_selection_window_sales_30d_settle",
 }
-FANS_LABEL = "粉丝量"
+# 【筛选】粉丝量 = 10w以下
+# 🔴 2026-09-22 平台改版：**「粉丝量」这个筛选项被改名为「粉丝指数」**（选项一字未变）。
+#    实测证据（.probe/probe_fans_seq.py，out/probe_fans_seq_out.txt）：
+#      FIND_FORMITEM_JS("粉丝量")   -> None（不存在）
+#      FIND_FORMITEM_JS("粉丝指数") -> {x:752, y:399, w:100, h:25}
+#      「粉丝指数」下拉选项 = 10w以下 / 10w-100w / 100w-300w / 300w-500w / 500w-1000w / 1000w以上
+#    这 6 档与原「粉丝量」完全一致（注意与结算额那套 1w以下/1w-10w/… 不同），
+#    所以只是**改名**，语义仍是粉丝数档位。
+#    改成候选列表：按顺序取第一个**页面上真实存在**的标签用，平台若改回旧名也照样能跑。
+#    覆盖：export FANS_LABELS="粉丝指数,粉丝量"
+FANS_LABELS = tuple(x.strip() for x in os.environ.get(
+    "FANS_LABELS", "粉丝指数,粉丝量").split(",") if x.strip())
+FANS_LABEL = FANS_LABELS[0]          # 兼容旧引用（日志/文档里仍按这个显示）
 FANS_OPTION = "10w以下"
 FANS_FIELD = "fans_num"
 CONTACT_FIELD = "has_contact"
@@ -1932,7 +1970,24 @@ def main():
         ok_sale = True
         for _opt in [o.strip() for o in SALE_OPTION.split("|") if o.strip()]:
             ok_sale = apply_formitem(SALE_LABEL, _opt, "sale") and ok_sale
-        ok_fans = apply_formitem(FANS_LABEL, FANS_OPTION, "fans")
+        # 粉丝量：平台 2026-09-22 把它改名成「粉丝指数」（见 FANS_LABELS 注释）。
+        # 先探测哪个标签真实存在，再应用 —— 不要无条件用第一个，否则平台改回旧名就全崩。
+        ok_fans, fans_used = False, None
+        for _lb in FANS_LABELS:
+            try:
+                if page.evaluate(FIND_FORMITEM_JS, _lb):
+                    fans_used = _lb
+                    break
+            except Exception:
+                pass
+        if fans_used is None:
+            log("  [fans] 候选标签在页面上都不存在: %s（平台可能又改名了，"
+                "用 FANS_LABELS=新名字,旧名字 覆盖）" % "/".join(FANS_LABELS))
+        else:
+            if fans_used != FANS_LABELS[0]:
+                log("  [fans] 首选标签 %s 不存在，回退用 %s"
+                    % (FANS_LABELS[0], fans_used))
+            ok_fans = apply_formitem(fans_used, FANS_OPTION, "fans")
         ok_contact = apply_formitem("有联系方式", None, "contact")
         # 用户 2026-09-17 追加两条（都要走 agg 面板三步：请选择 -> 选项 -> 确认）
         #   ① 达人画像 -> 达人性别 = 女
@@ -2204,6 +2259,7 @@ def main():
         # ---------- 本地过滤 ----------
         seen, picked = set(), []
         stat = {"dup": 0, "male": 0, "region": 0, "noprov": 0, "settle": 0,
+                "fans": 0,
                 "nocate": 0, "catecombo": 0, "content": 0, "contentkeep": 0,
                 "nickkw": 0, "nickbrand": 0, "unauth": 0,
                 "z_nocate": 0, "z_single": 0}      # 分支 Z 的两个新判定结果
@@ -2211,6 +2267,7 @@ def main():
         content_drop = []               # 记录被内容类型剔除的样本（新规则上线后要能核对）
         cate_drop = []                  # 记录被类目规则剔除的样本（A 的 nocate/catecombo、Z 的两个）
         settle_drop = []                # 记录被规则2b（结算额兜底）剔除的样本
+        fans_drop = []                  # 规则2d（粉丝量兜底）剔除的样本
         unauth_drop = []                # 规则2c：因「未授权数据 + 等级够」被放行的样本
         for r in rows:
             k = norm_name(r["nickname"])
@@ -2227,6 +2284,16 @@ def main():
             if not any(p in city for p in CN_PROVINCE):
                 stat["noprov"] += 1
                 continue
+            # 规则2d：本地兜底过滤「粉丝量 = 10w以下」（2026-09-22 新增）
+            #   平台侧该筛选项已被改名为「粉丝指数」，且平台筛选一贯不严格 -> 本地再拦一道。
+            if LOCAL_FANS_FILTER:
+                _fok, _fnote = fans_ok(r.get("fans"))
+                if not _fok:
+                    stat["fans"] += 1
+                    if len(fans_drop) < 40:
+                        fans_drop.append("%s(fans=%s)" % (
+                            (r["nickname"] or "")[:16], _fnote))
+                    continue
             # 规则2b：本地兜底过滤「直播结算总额」（平台侧筛选不严格，见文件头说明）
             # 规则2c：读不到结算额（未授权数据）但等级 >= UNAUTH_LEVEL_MIN -> 放行
             if LOCAL_SETTLE_FILTER:
@@ -2293,11 +2360,16 @@ def main():
             "只含一个主词条时内容类型需命中 %s）" % "/".join(Z_SINGLE_CONTENT)
             if FILTER_PROFILE == "Z" else "（历史规则）"))
         log("  本地过滤：重复 %d / 非女性 %d / 敏感地区 %d / 非大陆 %d "
-            "/ 结算额不合格 %d / 无目标类目 %d / 排除类目组合 %d / 排除内容类型 %d "
-            "/ 昵称排除词 %d / 昵称品牌 %d -> 保留 %d" % (
+            "/ 粉丝超限 %d / 结算额不合格 %d / 无目标类目 %d / 排除类目组合 %d "
+            "/ 排除内容类型 %d / 昵称排除词 %d / 昵称品牌 %d -> 保留 %d" % (
                 stat["dup"], stat["male"], stat["region"], stat["noprov"],
-                stat["settle"], stat["nocate"], stat["catecombo"], stat["content"],
-                stat["nickkw"], stat["nickbrand"], len(picked)))
+                stat["fans"], stat["settle"], stat["nocate"], stat["catecombo"],
+                stat["content"], stat["nickkw"], stat["nickbrand"], len(picked)))
+        if LOCAL_FANS_FILTER:
+            log("  规则2d 粉丝量兜底：粉丝 <= %d（本地再拦一道；平台侧该项已改名「粉丝指数」）"
+                % FANS_MAX)
+        else:
+            log("  规则2d 粉丝量兜底：已关闭（LOCAL_FANS_FILTER=0）")
         if UNAUTH_LEVEL_MIN > 0:
             log("  规则2c 未授权放行：结算额读不到 且 等级>=LV%d -> 放行 %d 个"
                 % (UNAUTH_LEVEL_MIN, stat["unauth"]))
@@ -2318,6 +2390,8 @@ def main():
                 % ("/".join(CONTENT_KEEP), stat["contentkeep"]))
         if settle_drop:
             log("  结算额被剔除样本：%s" % " | ".join(settle_drop))
+        if fans_drop:
+            log("  粉丝量被剔除样本：%s" % " | ".join(fans_drop))
         if cate_drop:
             log("  类目被剔除样本：%s" % " | ".join(cate_drop))
         if nick_drop:

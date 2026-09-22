@@ -104,6 +104,12 @@ def main():
                 okz, _h, whyz = C.z_verdict(r.get("main_cate"), r.get("content_type"))
                 if not okz:
                     why.append("Z类目:" + str(whyz))
+            # 规则2d 粉丝量兜底（2026-09-22 补：回收原先不查粉丝量，
+            #   而 `--merge` 会直接把合格项写进 darens.json）
+            if C.LOCAL_FANS_FILTER:
+                _fok, _fnote = C.fans_ok(r.get("fans"))
+                if not _fok:
+                    why.append("2d粉丝%s" % _fnote)
             # 规则2c 放行的达人「带货分析」本来就读不到 -> 下列 3a/3b/3c/3d/3f 的样本
             # 字段是空的，各判定函数对空样本都返回「不判定」，不会误杀，故无需额外跳过。
             hit = C.product_exclude_hit(r.get("titles"))

@@ -80,6 +80,12 @@ def main():
         okz, _h, whyz = C.z_verdict(r.get("main_cate"), r.get("content_type"))
         if not okz:
             why.append("Z类目:%s" % whyz)
+        # 规则2d 粉丝量兜底（2026-09-22 补：复核闸原先不查粉丝量，
+        #   而平台侧「粉丝量」筛选项已改名「粉丝指数」，漏一次就会放进大号）
+        if C.LOCAL_FANS_FILTER:
+            _fok, _fnote = C.fans_ok(r.get("fans"))
+            if not _fok:
+                why.append("2d粉丝%s" % _fnote)
         if unauth_pass:
             # 规则2c 命中：带货分析（3a/3b/3c/3d/3f）在采集时已因「未授权」被免掉，
             # 名单里这几个字段本就是空的 -> 不再拿它们判不合格，否则会误杀。

@@ -71,7 +71,24 @@ SETTLE_CASES = [
     ("10000", "25000", True),    # 字符串数字 -> 按数字比
 ]
 
-# 规则2b 取区间用的 settle_pair(rec) —— 2026-09-22 新增：
+# 规则2d：本地兜底过滤「粉丝量 = 10w以下」（2026-09-22 新增）
+# 起因：① 平台把「粉丝量」这个筛选项**改名成了「粉丝指数」**（选项一字未变）；
+#      ② 本地过滤此前**完全没有**粉丝量这一关（bad_fans() 只是抽样统计、不拦数据），
+#         平台侧一旦没生效就会收进大号。
+# 口径：fans > FANS_MAX(默认 100000) 剔除；取不到数值 = 未判定 = 剔除。
+FANS_CASES = [
+    (99999, True),        # 区间内
+    (100000, True),       # 边界：等值 -> 放行（与 settle_ok 的闭区间口径一致）
+    (100001, False),      # 刚超一点
+    (1500000, False),     # 百万级大号
+    (25000, True),
+    (0, True),            # 0 粉也算 <= 上限
+    (None, False),        # 取不到数值 -> 未判定 -> 剔除
+    ("abc", False),       # 非数字
+    ("25000", True),      # 字符串数字
+]
+
+# rules 2b 取区间用的 settle_pair(rec) —— 2026-09-22 新增：
 #   复核/回收/救急三个脚本都靠它从「名单记录」里取 (low, high)。
 #   归档里的存档形态不统一（341 条里 251 条是扁平 live_low/high、64 条只有
 #   settle_live={low,high}、26 条两者都没有），不兼容就会把 64 条误判成「无数据」。
@@ -122,6 +139,14 @@ def main():
             "PASS" if good else "FAIL", lo, hi, ok, note,
             C.SETTLE_MIN, C.SETTLE_MAX))
     print("-" * 78)
+    for fans, want_ok in FANS_CASES:
+        ok, note = C.fans_ok(fans)
+        good = (ok == want_ok)
+        if not good:
+            bad += 1
+        print("%s  fans_ok(%-8s) -> ok=%-5s note=%s   [上限 %s]" % (
+            "PASS" if good else "FAIL", fans, ok, note, C.FANS_MAX))
+    print("-" * 78)
     for rec, want in SETTLE_PAIR_CASES:
         got = C.settle_pair(rec)
         good = (got == want)
@@ -140,7 +165,7 @@ def main():
             "PASS" if good else "FAIL", str(rec)[:38], ok, note))
     print("-" * 78)
     total = (len(CATE_CASES) + len(PRODUCT_CASES) + len(SETTLE_CASES)
-             + len(SETTLE_PAIR_CASES) + len(SETTLE_PAIR_FLOW))
+             + len(FANS_CASES) + len(SETTLE_PAIR_CASES) + len(SETTLE_PAIR_FLOW))
     print("失败 %d 项" % bad if bad else "全部通过（%d 组用例）" % total)
     return 1 if bad else 0
 

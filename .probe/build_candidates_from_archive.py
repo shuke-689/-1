@@ -62,8 +62,12 @@ def verdict(r):
         bad.append("非微信号(%s)" % r.get("contact_type"))
     if FEMALE_ONLY and r.get("gender") != 2:
         bad.append("非女性(gender=%s)" % r.get("gender"))
-    if (r.get("fans") or 0) >= 100000:
-        bad.append("粉丝>=10w")
+    # 规则2d 粉丝量兜底：与 collect.py 复用同一个 fans_ok（2026-09-22 起统一口径；
+    #   平台侧「粉丝量」已改名「粉丝指数」，本地这道不能省）
+    if C.LOCAL_FANS_FILTER:
+        _fok, _fnote = C.fans_ok(r.get("fans"))
+        if not _fok:
+            bad.append("粉丝(%s)" % _fnote)
     city = r.get("city") or ""
     if any(x in city for x in ("海南", "新疆", "西藏")):
         bad.append("地区排除(%s)" % city)
