@@ -119,7 +119,7 @@ tasklist /fi "imagename eq python.exe"    # 应该只有你要启的那一个
 | ① | **主推类目**（级联） | 批①`个护家清 > 个人护理`　批②`美妆 > 不限` | 点父类目按钮 → 级联面板点子项；`APPLY_CATE_CASCADE` | `main_cate_new:["5"/"9"]`；选了子类目还带 `common_selection_first_cate_code`（个人护理=`1000003462`） |
 | ② | **内容类型** | 13 项：`亲子/休闲娱乐/剧情/情感/时尚/明星/母婴/生活记录/舞蹈/艺术/音乐/颜值/其他` | 🔴 先点 form-item 右侧「**展开**」，再逐个点 chip | `content_type:["亲子",...]`（**中文名**） |
 | ③ | **直播结算总额** | `1w-10w` | 普通下拉，单选 | `common_range_selection_live_sale_30d_settle` 见 `SALE_FIELD_BY_LABEL`，实测 `common_range_selection_live_sales_30d_settle:["2"]` |
-| ④ | **有联系方式** | 勾选（开关型，点一下即生效） | `apply_contact_filter()`；标签 `CONTACT_LABEL`（默认 `有联系方式`）；开关 `PLATFORM_CONTACT_FILTER`（默认 **1**） | `has_contact:["1"]` |
+| ④ | **有联系方式** | 勾选（开关型，点一下即生效） | `apply_contact_filter()`；标签 `CONTACT_LABEL`（默认 `有联系方式`）；开关 `PLATFORM_CONTACT_FILTER`（默认 **1**） | `has_contact:["true"]`（🔴 是**字符串 "true"**，不是 `1`；2026-09-22 批②实测） |
 
 🔴 **④ 为什么必须留着（实测，别再手滑删掉）**
 
@@ -341,7 +341,7 @@ export BATCH_COOLDOWN=300 MAX_RETRY=3      # 批次冷却 + 限流重试
 | **规则5** | 每批取满 **TARGET_DAREN 个有效达人** 即停止该批（双批驱动默认各 **30**，2026-09-17 由 15 调深） | 主循环里 `valid_n >= TARGET_DAREN` 就 `break` |
 | | **内容类型**（2026-09-22 **新增到平台侧**）：先点「内容类型」form-item 右侧的「**展开**」，再点选 13 项：<br>亲子 / 休闲娱乐 / 剧情 / 情感 / 时尚 / 明星 / 母婴 / 生活记录 / 舞蹈 / 艺术 / 音乐 / 颜值 / 其他 | `content_type:["亲子",...]`（**中文名**，不是 id）；`apply_content_types()`；无 ui 选项可用 `CONTENT_TYPES` 环境变量覆盖 |
 | | **直播结算总额 = 1w-10w**（2026-09-16 由「结算总额」改） | `common_range_selection_live_sales_30d_settle:["2"]` |
-| | **有联系方式**（2026-09-22 晚用户要求**加回平台侧**）：勾选，开关型 form-item | `has_contact:["1"]`；`apply_contact_filter()`；**软校验**（不进 `bad`）、找不到标签也软失败；实测加回后微信率 13% → 48%~57% |
+| | **有联系方式**（2026-09-22 晚用户要求**加回平台侧**）：勾选，开关型 form-item | payload `has_contact:["true"]`（**字符串 "true"**，不是 `1`；09-22 批②实测日志 `[contact] payload 校验通过：has_contact=['true']`）；`apply_contact_filter()`；**软校验**（不进 `bad`）、找不到标签也软失败；实测加回后微信率 13% → 48%~57% |
 | | ~~粉丝量 / 达人画像 / 粉丝画像~~ | 🔴 **2026-09-22 按用户要求从平台侧移除**（原话：「A阶段平台侧筛选全部清除」）。粉丝量有本地兜底（规则2d）、达人性别有本地兜底（`gender!=2`）；粉丝性别**无本地兜底** |
 | **规则2d** | **本地兜底过滤粉丝量**（2026-09-22 新增，**默认开启**）：`fans <= FANS_MAX`（默认 **100000**），**取不到数值一律剔除**。<br>为什么需要：① 平台侧该项改名期间/平台筛选不严格时本地**完全没有**这一关（`bad_fans()` 只是抽样计数、不拦数据）；② 与规则2b 同源经验——平台筛选会漏（结算额实测漏 ~10%） | `fans_ok(fans)`；关掉 `LOCAL_FANS_FILTER=0`；改上限 `FANS_MAX=50000`。日志打「规则2d 粉丝量兜底：粉丝 <= 100000」+ 剔除样本 |
 | **规则2b** | **本地兜底过滤结算额**（2026-09-17 新增，**默认开启**）：按 `live_low/live_high` 与 `SETTLE_MIN/SETTLE_MAX` 比对，不合格或**取不到数值**一律剔除 | `settle_ok(live_low, live_high)`；区间由 `SALE_OPTION` 反推（默认 `10000/100000`，多选取并集）；可用 `LOCAL_SETTLE_FILTER=0` 关掉 |
@@ -409,6 +409,35 @@ export BATCH_COOLDOWN=300 MAX_RETRY=3      # 批次冷却 + 限流重试
 > 达人详情里的实际数值在接口 `sale_info.*`：
 > `total_sales_settle` / `live_total_sales_settle` / `video_total_sales_settle` / `image_text_total_sales_settle`
 > （各含 `sale_low` / `sale_high` 区间）。
+
+### 🔴 列表接口会「静默截断」—— 会被当成「这批没什么人」合并进正式名单（2026-09-22 实测）
+
+**现象**（`out/_run50.log`，2026-09-22 批② 美妆 > 不限）：
+
+```
+[17:37:06]   连续 15 屏无新增且接口仅 2 条 -> 判定列表加载异常，提前结束
+[17:37:06]   去重后 37 个达人
+[17:37:06]   候选池 10 个达人
+[17:41:16]   完成：处理 10 个达人，2 个取到联系方式
+[17:41:22]   合并结果：共 152 个达人（去重后）…   ← 上一版 217 条被打成 152 条
+```
+
+- **真因是限流**，不是「美妆没数据」：美妆 > 不限 只挂 13 个内容类型 + 1w-10w + 有联系方式，
+  绝不可能只有 37 个人。前一批（个护家清）到 17:19 还在连续撞 `11001`，
+  冷却 300 秒后（17:33）就开跑美妆 —— **限流窗口根本没过去**。
+- **为什么没被拦住**：`collect.py` 原有的「限流」保护只认 `rl["hit"] and not dumped_any`
+  （接口一条都没回）。这次回了 37 条 → `dumped_any=True` → 走正常解析路径 →
+  **从容地产出一份只有 10 个候选的小名单**，`collect_30.py` 看到退出码 0、有产物，
+  就当「批完成」合并进 `darens.json`。
+- **已修（`collect.py`）**：`空转判定` 命中时置 `list_truncated=True`，解析前先拦一道 ——
+  **不产出本批名单**，改为写 `out/collect/ratelimit<tag>.txt`（内容 `list_truncated …`），
+  让 `collect_30.py` 走**限流那条重试路径**（冷却 `BATCH_COOLDOWN`=300 秒，比筛选中止的 45 秒更合适）。
+  开关 `TRUNCATION_GUARD=0` 可关（排查「这个组合本来就没什么人」时用）。
+- **待修**：`collect_30.py::main()` 在**任一批失败**时仍会用已收集到的那批覆盖 `darens.json`
+  → 一次性把 217 条打成一批的量。重跑前先备份 `darens.json`，或用
+  `tools/merge_into_darens.py --from <json>` 把补采产物并回正式名单。
+- **教训（通用）**：**退出码 0 + 有产物 ≠ 这批是好的**。
+  判断一批是否可信，要看「候选池数量是否符合该类目量级」，而不是看脚本有没有报错。
 
 ### ⚠️ 平台侧「直播结算总额」筛选**不严格** —— 必须靠规则2b 兜底（2026-09-17 实测）
 

@@ -185,11 +185,15 @@ def main():
         " + ".join("%s>%s×%d" % (p, c, t) for p, c, _, t in JOBS), BATCH_COOLDOWN))
 
     all_recs = []
+    failed = []                    # 产出为空的批次（限流/被截断/中止）
     for idx, (parent, child, tag, target) in enumerate(JOBS):
         if idx:
             log("冷却 %d 秒，等平台限流窗口过去…" % BATCH_COOLDOWN)
             time.sleep(BATCH_COOLDOWN)
-        all_recs.extend(run_batch(parent, child, tag, target))
+        recs = run_batch(parent, child, tag, target)
+        if not recs:
+            failed.append("%s>%s" % (parent, child))
+        all_recs.extend(recs)
         if NEED_LOGIN["v"]:
             log("!! 一直没检测到精选联盟登录 -> 中止整个采集流程")
             log("!! collect.py 已在你打开的 Edge 窗口里等待；若超时了，可加大等待时间：")
@@ -218,6 +222,18 @@ def main():
 
     if not merged:
         log("!! 两批都没有产出（很可能仍被限流）-> 不覆盖已有正式名单")
+        return
+
+    # 🔴 有批次失败时**不许覆盖正式名单**（2026-09-22 踩过）：
+    #    批② 美妆被限流截断（只 10 个候选 / 2 个有效），却因退出码 0 + 有产物被当成成功，
+    #    结果 217 条的 darens.json 被打成 152 条。少一批就只算「半个名单」，
+    #    宁可不动正式文件，让人看到日志后补跑。
+    if failed:
+        log("!! 有批次没产出：%s -> **不覆盖正式名单 darens.json**" % " / ".join(failed))
+        log("!! 本批已产出的部分在各 tag 文件里：out/collect/darens_<tag>.json")
+        log("!! 补跑：等限流窗口过去后重跑本脚本；或单批重跑：")
+        log("!!   CATE_PARENT=美妆 CATE_CHILD=不限 OUT_TAG=_mz TARGET_DAREN=25 python collect.py")
+        log("!! 补完再并入正式名单：tools/merge_into_darens.py --from out/collect/darens_mz.json")
         return
 
     sys.path.insert(0, BASE)

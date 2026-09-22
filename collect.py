@@ -121,6 +121,11 @@ DUMP_APIS = os.environ.get("DUMP_APIS", "") not in ("", "0", "false", "False")
 DAREN_PAUSE = float(os.environ.get("DAREN_PAUSE", "2.0"))      # 每个达人主页之间的间隔秒
 RATE_BACKOFF = int(os.environ.get("RATE_BACKOFF", "90"))       # 命中限流后的退避秒数
 SCROLL_PAUSE = float(os.environ.get("SCROLL_PAUSE", "2.8"))    # 每屏滚动后的等待秒
+# 【列表截断护栏】列表接口只回很少几条就再也滚不动时，视为**被限流截断**：
+#   不产出本批名单 + 写 ratelimit<tag>.txt，让 collect_30.py 冷却后重试（默认开）。
+#   关掉：TRUNCATION_GUARD=0（适合「这个筛选组合本来就没什么人」的排查场景）
+TRUNCATION_GUARD = os.environ.get(
+    "TRUNCATION_GUARD", "1").lower() not in ("0", "false", "no", "off", "")
 # 【规则5】取满多少个「有效达人」（成功取到联系方式）即停止筛选
 TARGET_DAREN = int(os.environ.get("TARGET_DAREN", "30"))
 
@@ -2149,6 +2154,8 @@ def main():
             log("  ! 一直没等到滚动容器（继续尝试滚动，容器出现后会自动生效）")
         last_n, stall = -1, 0
         STALL_LIMIT = 5
+        # 列表被「静默截断」标记（接口只回很少几条就再也滚不动）—— 见下面 2205 行附近的判定
+        list_truncated = False
         # 护栏：容器一直找不到时别空转满 MAX_SCROLL 屏（2026-09-17 实测空转 50 屏、约 2 分钟）
         no_cont, NO_CONT_LIMIT = 0, 12
         for s in range(MAX_SCROLL):
@@ -2190,6 +2197,7 @@ def main():
             if stall >= 15 and len(apis) <= 2:
                 log("  连续 %d 屏无新增且接口仅 %d 条 -> 判定列表加载异常，提前结束" % (
                     stall, len(apis)))
+                list_truncated = True
                 break
             last_n = got
 
@@ -2214,6 +2222,32 @@ def main():
                 with open(os.path.join(OUT, "ratelimit%s.txt" % OUT_TAG), "w",
                           encoding="utf-8") as f:
                     f.write("%s %s\n" % (rl["code"], rl["msg"]))
+                log("!! 已写标记 out/collect/ratelimit%s.txt（供 collect_30.py 冷却后重试）"
+                    % OUT_TAG)
+            except Exception:
+                pass
+            time.sleep(2)
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            return
+
+        if list_truncated and not rl["hit"] and TRUNCATION_GUARD:
+            # 🔴 2026-09-22 新增：列表「静默截断」也要算限流，**绝不能当成功**。
+            # 踩过（09-22 批②美妆）：接口只回了 2 条响应 / 去重 37 个达人，
+            # 「连续 15 屏无新增」触发了上面的异常判定；但因为 dumped_any=True，
+            # 走的是正常解析路径 → 本批只交出 **10 个候选 / 2 个有效**，
+            # 却被 collect_30.py 当成「批完成」合并进正式名单，**把上一版 217 条打成 152 条**。
+            # 真因是列表接口被限流（前面刚连续撞了 12 次 11001），不是「美妆真没数据」：
+            # 美妆>不限 只挂 13 个内容类型 + 1w-10w + 有联系方式，绝不可能只有 37 个人。
+            # 处理方式与限流完全一致：**不产出本批名单**，写标记让 collect_30 冷却后重试。
+            log("!! 列表疑似被限流截断（仅 %d 个接口响应就再也滚不出新数据）"
+                "-> 本批不产出名单" % len(apis))
+            try:
+                with open(os.path.join(OUT, "ratelimit%s.txt" % OUT_TAG), "w",
+                          encoding="utf-8") as f:
+                    f.write("list_truncated 接口响应仅 %d 条\n" % len(apis))
                 log("!! 已写标记 out/collect/ratelimit%s.txt（供 collect_30.py 冷却后重试）"
                     % OUT_TAG)
             except Exception:
