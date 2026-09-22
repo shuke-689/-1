@@ -6,7 +6,8 @@
 
 它做的事（**只读归档，只写 darens.json**）：
   1. 读 out/collect/archive/darens_*.json，按 uid 去重；
-  2. 按**现行**业务规则复检（类目组合 / 内容类型 / 昵称排除 / 店铺禁忌词 / 同品牌占比）；
+  2. 按**现行**业务规则复检（结算额兜底2b/2c / 类目（跟随 FILTER_PROFILE，默认 Z）/
+     内容类型 / 昵称排除 / 店铺禁忌词 / 同品牌占比）；
   3. 只保留 `contact_type == 微信`（**手机号一律搜不到，直接丢**）；
   4. 再按 **contact 去重**（同一微信号可能挂在两个 uid 下，否则会重复搜索）;
   5. 跳过已在 out/wechat/add_results.json 台账里处理过的 uid；
@@ -66,7 +67,22 @@ def verdict(r):
     city = r.get("city") or ""
     if any(x in city for x in ("海南", "新疆", "西藏")):
         bad.append("地区排除(%s)" % city)
-    ok, _hits, why = C.cate_verdict(r.get("main_cate") or [])
+    # 规则2b 结算额兜底（2026-09-22 补：此前这里**漏了**结算额这一关，
+    #   于是从 archive 救急重建的名单可能混进「直播结算总额不在 1w-10w」的达人）。
+    #   与 collect.py 复用同一个 settle_ok / settle_unreadable / level_ok，避免口径分叉。
+    # 规则2c：结算额读不到数值但等级 >= UNAUTH_LEVEL_MIN 的，collect.py 放行 -> 这里同样放行。
+    if C.LOCAL_SETTLE_FILTER:
+        _lo, _hi = C.settle_pair(r)     # 兼容 live_low/high 与 settle_live{low,high} 两种存档形态
+        ok_s, note = C.settle_ok(_lo, _hi)
+        if not ok_s and not (C.settle_unreadable(_lo, _hi) and C.level_ok(r.get("level"))):
+            bad.append("结算额(%s)" % note)
+    # 类目判定跟随采集器的现行口径（FILTER_PROFILE 默认 Z；A 仅回溯用）。
+    # ⚠️ 2026-09-22 前这里**硬编码 cate_verdict**（A 分支的历史规则），
+    #    与 09-19 起的「默认分支 Z」不一致 -> 会把 Z 口径下合格的达人误判掉。
+    if C.FILTER_PROFILE == "Z":
+        ok, _hits, why = C.z_verdict(r.get("main_cate") or [], r.get("content_type") or [])
+    else:
+        ok, _hits, why = C.cate_verdict(r.get("main_cate") or [])
     if not ok:
         bad.append("类目(%s:%s)" % (why, r.get("main_cate")))
     ct_hit = [x for x in (r.get("content_type") or []) if x in C.CONTENT_EXCLUDE]

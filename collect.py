@@ -217,6 +217,40 @@ def _settle_bounds():
 
 SETTLE_MIN, SETTLE_MAX = _settle_bounds()
 
+# ---- 规则2c：「未授权数据」达人按等级放行（2026-09-19 用户新增）----------------
+# 用户原话：「添加规则，如遇到未授权数据的达人，看达人名字后的等级，大于等于2的，
+#            则可以进行添加。」
+# 「未授权数据」= 该达人的带货 / 结算数据读不到（页面显示未授权数据），
+# 表现为两条路：① 列表接口 sale_info 为空 -> 规则2b 判「无数据」；
+#              ② 达人主页「带货分析」拿不到商品行 -> 三a~三d 无法判定。
+# 按项目既有铁律，这两种「未判定」原本一律跳过；现在补一条例外：
+#   **等级（列表里昵称后的 LV 徽章 = 接口 author_level）>= UNAUTH_LEVEL_MIN 就放行。**
+# 只免掉「因未授权而无法判定」的关卡（规则2b + 带货分析四条），
+# **不依赖授权数据的规则（规则4 类目 / 规则6 内容类型 / 规则7 昵称）照旧执行**。
+# 关掉：UNAUTH_LEVEL_MIN=0
+UNAUTH_LEVEL_MIN = int(os.environ.get("UNAUTH_LEVEL_MIN", "2"))
+
+
+def settle_unreadable(live_low, live_high):
+    """结算额是否「读不到数值」（= 未授权数据的表现之一）。"""
+    try:
+        int(live_low)
+        int(live_high)
+        return False
+    except Exception:
+        return True
+
+
+def level_ok(level, min_level=None):
+    """达人等级（LV 徽章 / author_level）是否 >= 门槛。取不到一律 False。"""
+    m = UNAUTH_LEVEL_MIN if min_level is None else min_level
+    if m <= 0:
+        return False
+    try:
+        return int(level) >= m
+    except Exception:
+        return False
+
 
 def settle_ok(live_low, live_high, lo=None, hi=None):
     """规则2b 判定：直播结算额是否落在兜底区间内。
@@ -234,6 +268,23 @@ def settle_ok(live_low, live_high, lo=None, hi=None):
     if x < a or y > b:
         return False, "%s-%s" % (x, y)
     return True, "%s-%s" % (x, y)
+
+
+def settle_pair(rec):
+    """从一条**名单记录**里取 (low, high)。
+
+    优先用扁平字段 `live_low` / `live_high`（collect.py 现行写法）；
+    老归档 / 手工合并过的记录只有 `settle_live = {low, high}`（`rng()` 的产物），
+    这时回退到它 —— 否则复核类脚本会把它们全判成「无数据」误杀。
+    两个都没有（如 09-15 那批只有 `video_*` 的记录）返回 (None, None) -> 判否。
+    """
+    lo, hi = rec.get("live_low"), rec.get("live_high")
+    if lo is None and hi is None:
+        sl = rec.get("settle_live") or {}
+        lo, hi = sl.get("low"), sl.get("high")
+    return lo, hi
+
+
 # 高级筛选界面名 -> 接口字段名（用于 payload 端到端校验）
 SALE_FIELD_BY_LABEL = {
     "结算总额": "common_range_selection_author_sale_gmv_30d_settle",
@@ -250,13 +301,59 @@ CATE_FIELD = "main_cate_new"
 # 类目名 -> 接口 id（实测自 payload，仅用于校验；选类目本身仍走 UI 级联）
 CATE_ID_BY_NAME = {"个护家清": "5", "美妆": "9"}
 
+# 【筛选】达人画像 -> 达人性别=女 ； 粉丝画像 -> 粉丝性别=女性居多
+#    （用户 2026-09-17 追加，第二批）
+# ------------------------------------------------------------------
+# 平台结构（实测自 out/stage5/filter.json 的 GET /square_pc_api/square/filter，
+#          + 2026-09-17 探针 .probe/probe_portrait.py 实测 DOM）：
+#   达人信息
+#     ├ 达人画像      author_portrait   (type=agg，点开是 .quick-filter-button-agg-pop 面板)
+#     │   ├ 达人性别  author_gender     (type=ratio)  选项: 不限 / 男=1 / 女=2
+#     │   ├ 达人地区  author_location   (type=cascade)
+#     │   └ 签约机构  bind_institution  (type=ratio)
+#     ├ 粉丝画像      fan_portrait
+#     │   └ 粉丝性别  fans_gender       (选项: 不限 / 男性居多=1 / 女性居多=2)
+#     └ 粉丝偏好      fans_profile
+# 🔴 交互**不是**「点开面板就能看到 女」：面板里是若干「标签 + 请选择▾」的行，
+#    必须走三步：① 点该行的 .auxo-select-selection-placeholder（文本「请选择」）
+#                ② 在弹出的 .auxo-select-dropdown 里点选项
+#                ③ 点面板里的「确认」（.quick-filter-button-agg-btns 里的 span）
+#    第一版直接找文本「女」→ 实测失败（面板 radios=[]，text='达人性别 请选择 …'）。
+# ⚠️ 平台文案：达人是「女」（**不是**「女性」）；粉丝是「女性居多」。
+# 为什么要加：本地规则本来就有 `gender == 2`，但那是**采完之后**才过滤 ——
+#   实测 2026-09-17 ghq 批 109 个里 **41 个（38%）是男性**，白占候选池名额。
+# 关掉：把对应 OPTION 设成 "" 或 不限
+PORTRAIT_LABEL = os.environ.get("PORTRAIT_LABEL", "达人画像")
+PORTRAIT_SUB = os.environ.get("PORTRAIT_SUB", "达人性别")
+PORTRAIT_OPTION = os.environ.get("PORTRAIT_OPTION", "女")
+PORTRAIT_FIELD = "author_gender"
+PORTRAIT_VALUE = "2"                     # 女 = 2（男 = 1）
+
+FANS_PROFILE_LABEL = os.environ.get("FANS_PROFILE_LABEL", "粉丝画像")
+FANS_GENDER_SUB = os.environ.get("FANS_GENDER_SUB", "粉丝性别")
+FANS_GENDER_OPTION = os.environ.get("FANS_GENDER_OPTION", "女性居多")
+FANS_GENDER_FIELD = "fans_gender"
+FANS_GENDER_VALUE = "2"                  # 女性居多 = 2（男性居多 = 1）
+
 # 【规则1】主推类目 = 「个护家清」（级联菜单里选「不限」= 整个个护家清大类）
 # 如需只取某个子类目，设 CATE_CHILD=个人护理 / 家清纸品
 # 用户 2026-09-15 追加：类目再加「美妆」（同样选「不限」）
 # 每批目标有效达人数见 collect_30.py 的 GHQ_TARGET / MZ_TARGET（默认各 30）
+#
+# 🔴 用户 2026-09-17 第二批要求（原话）：
+#    「在主推类目中，不对类目进行筛选，只在下方查看达人时，
+#      选择之前所要求的类目达人」
+#    → **平台侧不再筛类目**（主推类目留「全部」），类目要求改由**本地规则4**
+#      `cate_verdict(author_tag.main_cate)` 把关 —— 那正是列表里每行显示的
+#      那串类目标签（如「个护家清, 美妆」），也就是「在下方查看达人时挑人」。
+#    探针 .probe/probe_square.py 已确认：页面**没有**叫「查看达人」的控件，
+#    唯一的类目控件就是「主推类目」这一行 chips。
+#    想恢复旧的平台侧筛选：export PLATFORM_CATE_FILTER=1
 CATE_PARENT = os.environ.get("CATE_PARENT", "个护家清")
 CATE_CHILD = os.environ.get("CATE_CHILD", "不限")
 CATES = ((CATE_PARENT, CATE_CHILD),)
+PLATFORM_CATE_FILTER = os.environ.get(
+    "PLATFORM_CATE_FILTER", "0").lower() not in ("0", "false", "no", "off", "")
 
 # 规则3：带货商品全部来自同一家 -> 跳过该达人
 # 店铺名归一化后缀（用于取品牌名做同源判断）
@@ -283,6 +380,48 @@ CATE_EXCLUDE_PARTNER = (
     "智能家居", "玩具乐器", "鲜花园艺", "3C数码家电", "鞋靴箱包", "虚拟充值",
     "钟表配饰", "珠宝文玩", "医疗健康", "原料包装", "餐饮外卖",
 )
+
+# ===========================================================================
+# 【分支 Z】A 阶段的新筛选口径（用户 2026-09-19 定；原话见 RUNBOOK「分支 Z」）
+# 🔴 用户 2026-09-19 追加定调：「以后按照 A（分支Z）-B-C 执行，
+#    不要再询问用哪个分支，**默认按分支 Z**」-> 默认值已改为 Z。
+#   FILTER_PROFILE=Z（默认）= 启用下面这套（现行口径）
+#   FILTER_PROFILE=A        = 历史规则（上面那套），仅回溯/对比时用
+# 另见规则3f（单一店铺占比 >=50% 跳过，只在 Z 下生效，常量 SHOP_SHARE_RATIO）
+#
+# 用户原话要点：
+#   「销售结算额为 1-10W；主词条：个护家清、美妆二选一；副词条：服饰内衣、
+#     母婴宠物、滋补保健，必须包含一条以上主词条，副词条随意；也可两个主词条
+#     组合（个护家清/美妆）；也可以只有一个词条（只含美妆、或只含个护家清），
+#     但限制规则：在只有个护美妆的达人中，第二个词条要包含 时尚、情感、剧情、
+#     颜值、音乐、舞蹈、亲子 这些类目中的一个」
+#   「筛除昵称包含 香港/专场/供应链/品牌/折扣/养发/植发/工厂/美甲/睫毛/草本
+#     这些词；达人地址去除 新疆、西藏、海南、海外」
+#
+# 落成规则（Z 分支）：
+#   Z1 结算额：直播结算总额 = 1w-10w（与 A 同：SETTLE_MIN/MAX = 10000/100000）
+#   Z2 主词条：main_cate 必须命中 Z_MAIN 里 >=1 个，否则判 "z_nocate"
+#   Z3 两个主词条全中（个护家清+美妆）-> 直接放行，第三个及以后类目不再限制
+#      （= 用户说的「如包含前两个，则不考虑第三个词条」）
+#   Z4 只中一个主词条：
+#        · 主推类目里**还有别的类目**（含副词条 服饰内衣/母婴宠物/滋补保健）
+#          -> 放行（「副词条随意，也可进行添加」）
+#        · 主推类目里**只有那一个主词条**（=「只有个护美妆的达人」）
+#          -> 内容类型必须命中 Z_SINGLE_CONTENT 之一，否则判 "z_single"
+#   Z5 内容类型黑名单：Z 分支**不启用** A 分支的 CONTENT_EXCLUDE
+#      （内容类型只在 Z4 那条「单主词条」场景里把关）
+#      —— 想恢复黑名单：export Z_CONTENT_BLACKLIST=1
+#   Z6 昵称排除词 / 地区排除：见 nick_rules.py 与 EXCLUDE_REGION，两分支共用
+#      （Z 追加的昵称词已并入 nick_rules.py 的 NICK_EXCLUDE_KW）
+# ===========================================================================
+FILTER_PROFILE = (os.environ.get("FILTER_PROFILE", "Z") or "Z").strip().upper()
+Z_MAIN = ("个护家清", "美妆")                 # 主词条（二选一或全选）
+Z_SUB = ("服饰内衣", "母婴宠物", "滋补保健")    # 副词条（随意，不作硬条件）
+# 只含一个主词条且没有别的类目时，内容类型必须命中这里的一个
+Z_SINGLE_CONTENT = ("时尚", "情感", "剧情", "颜值", "音乐", "舞蹈", "亲子")
+# Z 分支是否仍套用 A 分支的内容类型黑名单（默认关闭）
+Z_CONTENT_BLACKLIST = os.environ.get(
+    "Z_CONTENT_BLACKLIST", "0").lower() not in ("0", "false", "no", "off", "")
 
 # 【规则3b】带货**商品名称**命中以下词 -> 排除该达人
 #   3b 用户 2026-09-15 追加：假发 / 院线 / 美甲
@@ -533,6 +672,193 @@ FORMITEM_TEXT_JS = """(name) => {
     return out;
 }"""
 
+# 在**可见浮层**里找文本严格等于 label 的可点项 —— 用于「达人画像」这类 agg 面板。
+# ---------------------------------------------------------------------------
+# 为什么不复用 apply_formitem 的下拉取法（.auxo-select-item-option-content）：
+#   「达人画像」type=agg（点开是个面板，里面再放 达人性别/达人地区/签约机构），
+#   面板里的「女」可能渲染成单选项(.auxo-radio-wrapper)、也可能是下拉项，
+#   只认一种选择器会漏。这里把常见容器/元素都收一遍，再去重取最内层。
+# 只在浮层（select-dropdown / popover / dropdown / tooltip / cascader）里找，
+# 明确排除筛选栏 div.auxo-form-item 与达人列表，避免点到页面其它「女」字。
+FIND_POPOVER_OPTION_JS = """(label) => {
+    const ROOT_SEL = '.auxo-select-dropdown, .auxo-popover, .auxo-dropdown, ' +
+                     '.auxo-tooltip, .auxo-cascader-menus, .auxo-modal-content';
+    const roots = Array.from(document.querySelectorAll(ROOT_SEL)).filter(e => {
+        const r = e.getBoundingClientRect();
+        if (r.width < 40 || r.height < 20) return false;
+        if (getComputedStyle(e).visibility === 'hidden') return false;
+        if (getComputedStyle(e).display === 'none') return false;
+        return r.bottom > 0 && r.top < (window.innerHeight + 300);
+    });
+    const EL_SEL = '.auxo-select-item-option-content, .auxo-radio-wrapper, li, label, span, div';
+    const out = [];
+    roots.forEach((root, ri) => {
+        const rb = root.getBoundingClientRect();
+        root.querySelectorAll(EL_SEL).forEach(e => {
+            if (e.closest('div.auxo-form-item')) return;          // 排除筛选栏本身
+            if (e.closest('table, .auxo-table-wrapper')) return;   // 排除达人列表
+            if ((e.innerText || '').trim() !== label) return;
+            // 只取「最内层」：子元素里还有同样文本的就跳过，否则点到外层大容器
+            let inner = false;
+            for (const c of e.children) {
+                if ((c.innerText || '').trim() === label) { inner = true; break; }
+            }
+            if (inner) return;
+            const r = e.getBoundingClientRect();
+            if (r.width < 8 || r.height < 8) return;
+            if (r.width > 420 || r.height > 140) return;
+            out.push({
+                x: Math.round(r.x), y: Math.round(r.y),
+                w: Math.round(r.width), h: Math.round(r.height),
+                tag: e.tagName,
+                cls: (e.className || '').toString().slice(0, 90),
+                rootIdx: ri,
+                rootCls: (root.className || '').toString().slice(0, 70),
+                rootBox: {x: Math.round(rb.x), y: Math.round(rb.y),
+                          w: Math.round(rb.width), h: Math.round(rb.height)},
+                checked: !!e.closest(
+                    '.auxo-radio-wrapper-checked, .auxo-select-item-option-selected, ' +
+                    '.auxo-checkbox-wrapper-checked')
+            });
+        });
+    });
+    const seen = new Set(), uniq = [];
+    out.forEach(o => {
+        const k = o.x + ',' + o.y + ',' + o.tag;
+        if (!seen.has(k)) { seen.add(k); uniq.push(o); }
+    });
+    return uniq;
+}"""
+
+# 诊断：把「达人画像」点开之后所有可见浮层的原文 dump 出来
+# （定位失败时直接从日志看出该点哪，不用另开探针占 profile）
+DUMP_POPOVERS_JS = """() => {
+    const ROOT_SEL = '.auxo-select-dropdown, .auxo-popover, .auxo-dropdown, ' +
+                     '.auxo-tooltip, .auxo-cascader-menus';
+    const out = [];
+    document.querySelectorAll(ROOT_SEL).forEach(e => {
+        const r = e.getBoundingClientRect();
+        if (r.width < 40 || r.height < 20) return;
+        out.push({
+            cls: (e.className || '').toString().slice(0, 90),
+            box: {x: Math.round(r.x), y: Math.round(r.y),
+                  w: Math.round(r.width), h: Math.round(r.height)},
+            text: (e.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 200),
+            radios: Array.from(e.querySelectorAll('.auxo-radio-wrapper')).map(x => ({
+                t: (x.innerText || '').trim(),
+                checked: x.className.toString().indexOf('checked') >= 0,
+                box: {x: Math.round(x.getBoundingClientRect().x),
+                      y: Math.round(x.getBoundingClientRect().y)}
+            })).slice(0, 12)
+        });
+    });
+    return out;
+}"""
+
+# ---------------------------------------------------------------------------
+# agg 面板（达人画像 / 粉丝画像）的**三步**交互 —— 2026-09-17 探针实测 DOM：
+#   <div class="auxo-popover quick-filter-button-agg-pop">
+#     <div class="auxo-label-wrapper">              <- 一行（如 达人性别）
+#       <div class="auxo-label-wrapper-label">达人性别</div>
+#       <div class="auxo-select …">…<span class="auxo-select-selection-placeholder">请选择</span>…
+#     <div class="auxo-label-wrapper">              <- 再一行（达人地区 / 签约机构）
+#     <div class="quick-filter-button-agg-btns"> 重置 确认 取消
+# 所以要点：① 面板里的「请选择」② 下拉里的选项 ③ 面板里的「确认」。
+# 第一版只找文本「女」→ 必然失败（面板里根本没有「女」，radios=[]）。
+# ---------------------------------------------------------------------------
+
+# 在 agg 面板里，按**行标签**找到该行的下拉触发器（「请选择」占位符 / selector）
+FIND_AGG_SUBSELECT_JS = """(sub) => {
+    const P = '.quick-filter-button-agg-pop';
+    const pops = Array.from(document.querySelectorAll(P)).filter(e => {
+        const r = e.getBoundingClientRect();
+        return r.width > 40 && r.height > 20;
+    });
+    for (const p of pops) {
+        for (const row of p.querySelectorAll('.auxo-label-wrapper')) {
+            const lab = row.querySelector('.auxo-label-wrapper-label');
+            if (!lab || (lab.innerText || '').trim() !== sub) continue;
+            const t = row.querySelector('.auxo-select-selection-placeholder') ||
+                      row.querySelector('.auxo-select-selector') ||
+                      row.querySelector('.auxo-select');
+            if (!t) continue;
+            const r = t.getBoundingClientRect();
+            if (r.width < 8 || r.height < 8) continue;
+            return {x: Math.round(r.x), y: Math.round(r.y),
+                    w: Math.round(r.width), h: Math.round(r.height),
+                    tag: t.tagName, cls: (t.className || '').toString().slice(0, 70)};
+        }
+    }
+    return null;
+}"""
+
+# 在可见的 select 下拉里点选项（文本严格相等）
+FIND_SELECT_OPTION_JS = """(opt) => {
+    const out = [];
+    document.querySelectorAll('.auxo-select-dropdown').forEach(dd => {
+        const dr = dd.getBoundingClientRect();
+        if (dr.width < 30 || dr.height < 20) return;
+        dd.querySelectorAll('.auxo-select-item-option, .auxo-select-item').forEach(e => {
+            if ((e.innerText || '').trim() !== opt) return;
+            const r = e.getBoundingClientRect();
+            if (r.width < 8 || r.height < 8) return;
+            out.push({x: Math.round(r.x), y: Math.round(r.y),
+                      w: Math.round(r.width), h: Math.round(r.height),
+                      tag: e.tagName, cls: (e.className || '').toString().slice(0, 70)});
+        });
+    });
+    return out[0] || null;
+}"""
+
+# agg 面板底部的按钮（重置 / 确认 / 取消）—— 选完必须点「确认」才生效
+FIND_AGG_BTN_JS = """(txt) => {
+    const P = '.quick-filter-button-agg-pop';
+    const pops = Array.from(document.querySelectorAll(P)).filter(e => {
+        const r = e.getBoundingClientRect();
+        return r.width > 40 && r.height > 20;
+    });
+    for (const p of pops) {
+        const scope = p.querySelector('.quick-filter-button-agg-btns') || p;
+        for (const e of scope.querySelectorAll('span, button, a')) {
+            const t = (e.innerText || '').trim();
+            if (t !== txt) continue;
+            let inner = false;
+            for (const c of e.children) {
+                if ((c.innerText || '').trim() === t) { inner = true; break; }
+            }
+            if (inner) continue;
+            const r = e.getBoundingClientRect();
+            if (r.width < 6 || r.height < 6) continue;
+            return {x: Math.round(r.x), y: Math.round(r.y),
+                    w: Math.round(r.width), h: Math.round(r.height),
+                    tag: e.tagName, cls: (e.className || '').toString().slice(0, 70)};
+        }
+    }
+    return null;
+}"""
+
+# 诊断：agg 面板每行「标签 -> 当前值」（失败时一眼看出卡在哪一步）
+DUMP_AGG_JS = """() => {
+    const out = [];
+    document.querySelectorAll('.quick-filter-button-agg-pop').forEach(p => {
+        const r = p.getBoundingClientRect();
+        if (r.width < 40 || r.height < 20) return;
+        const rows = [];
+        p.querySelectorAll('.auxo-label-wrapper').forEach(row => {
+            const lab = row.querySelector('.auxo-label-wrapper-label');
+            const val = row.querySelector('.auxo-select-selection-item') ||
+                        row.querySelector('.auxo-select-selection-placeholder');
+            rows.push([lab ? (lab.innerText || '').trim() : '',
+                       val ? (val.innerText || '').trim() : '']);
+        });
+        out.push({box: [Math.round(r.x), Math.round(r.y),
+                        Math.round(r.width), Math.round(r.height)],
+                  text: (p.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 200),
+                  rows: rows});
+    });
+    return out;
+}"""
+
 # 级联菜单里的子类目（如「个护家清 -> 个人护理」）
 FIND_CASCADER_JS = """(name) => {
     let out = null;
@@ -707,6 +1033,20 @@ CHEAP_RATIO = float(os.environ.get("CHEAP_RATIO", "0.90"))
 #   后面那个是划线原价），空值/异常给 "-"。
 PRICE_MIN_PARSE = float(os.environ.get("PRICE_MIN_PARSE", "0.80"))
 
+# 【规则3f｜分支 Z】单一**店铺**占所带商品的比例达到阈值 -> 跳过该达人
+#   用户原话（2026-09-19 追加，分支 Z）：
+#     「在带货商品分析中，同一个店铺商品超过 50% 以上，
+#       一个店铺占据了 50% 的品的，不做添加」
+#   ⚠️ 题面是**店铺**（不是品牌）—— 规则3 管的是「同品牌」（跨店也可能同品牌），
+#      3f 管的是「同店铺」（同店也可能多品牌）。两者独立判定，**先命中先跳过**。
+#   成立条件刻意与规则3 对齐（两个都要满足）：
+#     ① 最大店铺占比 >= SHOP_SHARE_RATIO（默认 50%）
+#     ② 该店铺件数**严格过半**（cnt*2 > total）
+#     ② 是为了防小样本误判：2 件商品来自 2 家不同店铺时各占 50%，
+#     字面满足阈值，但显然不是「就推这一家店」。
+#   只在 FILTER_PROFILE=Z 下生效（A 分支保持历史行为不变）。
+SHOP_SHARE_RATIO = float(os.environ.get("SHOP_SHARE_RATIO", "0.50"))
+
 # 【规则3e】带货**商品名或店铺名**含 YANGFA_KW，且占比 **> YANGFA_RATIO** -> 跳过
 #   用户原话（2026-09-17）：「达人所带货商品及商品店铺带养发，且占比超过50%的，也进行剔除」
 #   · 两条命中路径：商品标题含「养发」 **或** 商品所属店铺名含「养发」
@@ -838,6 +1178,26 @@ def cate_verdict(mc):
     return True, hits, ""
 
 
+def z_verdict(main_cate, content_type):
+    """【分支 Z】主推类目 + 内容类型判定。返回 (是否通过, 主词条命中数, 未通过原因)。
+
+    规则见文件上方「分支 Z」注释块 Z2~Z4。故意写成纯函数，方便进 test_rules.py 回归。
+    """
+    mc = list(main_cate or [])
+    hits = [c for c in Z_MAIN if c in mc]
+    if not hits:
+        return False, 0, "z_nocate"                      # Z2：一条主词条都没有
+    if len(hits) >= 2:
+        return True, len(hits), ""                       # Z3：两个主词条全中 -> 放行
+    others = [c for c in mc if c not in Z_MAIN]
+    if others:
+        return True, 1, ""                               # Z4a：还有别的类目 -> 放行
+    ct = list(content_type or [])
+    if any(c in Z_SINGLE_CONTENT for c in ct):
+        return True, 1, ""                               # Z4b：第二个词条达标
+    return False, 1, "z_single"                          # Z4b：只有个护/美妆 且内容类型不达标
+
+
 def product_exclude_hit(titles):
     """【规则3b】带货商品名命中禁忌词 -> 返回命中的词，否则 ''。"""
     blob = " ".join(t for t in (titles or []) if t)
@@ -894,6 +1254,28 @@ def shopcnt_verdict(shops):
     """
     uniq = sorted({s.strip() for s in (shops or []) if s and s.strip()})
     return len(uniq) <= MIN_SHOP_CNT, len(uniq), uniq
+
+
+def shopshare_verdict(shops):
+    """【规则3f｜分支 Z】单一店铺占比判定（只推一家店的铺货号）。
+
+    返回 (是否跳过, 最大占比, 店铺名, 商品总件数, 最大店铺件数)。
+    口径与 `brand_verdict` 完全对齐：占比 >= SHOP_SHARE_RATIO **且** 件数严格过半。
+    与 `shopcnt_verdict` 一致，只认店铺名本身（不模糊归并，宁可漏杀不可错杀）。
+    纯函数，便于回归。
+    """
+    rows = [s.strip() for s in (shops or []) if s and s.strip()]
+    total = len(rows)
+    if not total:
+        return False, 0.0, "", 0, 0
+    cnt = {}
+    for s in rows:
+        cnt[s] = cnt.get(s, 0) + 1
+    name = max(cnt, key=lambda k: (cnt[k], k))
+    n = cnt[name]
+    ratio = n / float(total)
+    skip = (ratio >= SHOP_SHARE_RATIO) and (n * 2 > total)
+    return skip, ratio, name, total, n
 
 
 def yangfa_verdict(prows):
@@ -1007,6 +1389,12 @@ def main():
 
         def on_request(req):
             try:
+                if os.environ.get("DBG_REQ"):
+                    u = req.url
+                    if req.method == "POST" and ("square" in u or "search" in u or "author" in u):
+                        log("    [dbg-req] %s | keys=%s" % (
+                            u.split("?")[0][-60:],
+                            ",".join(sorted(json.loads(req.post_data or "{}").get("filters", {}).keys()))[:120]))
                 if "search_feed_author" in req.url and req.method == "POST":
                     reqs.append(req.post_data or "")
             except Exception:
@@ -1128,6 +1516,98 @@ def main():
                 return True
             return False
 
+        def _dump_agg(tag):
+            """失败时把 agg 面板每行的「标签 -> 当前值」打出来，一眼看出卡在哪步。"""
+            try:
+                ds = page.evaluate(DUMP_AGG_JS) or []
+            except Exception as e:
+                log("  [%s]   dump agg 失败: %s" % (tag, str(e)[:70]))
+                return
+            if not ds:
+                log("  [%s]   （当前没有可见的 agg 面板 —— 面板被点掉了或结构变了）" % tag)
+            for d in ds[:4]:
+                log("  [%s]   面板 box=%s rows=%s text=%r"
+                    % (tag, d["box"], d["rows"], d["text"][:110]))
+
+        def _pop_texts():
+            try:
+                return page.evaluate(DUMP_POPOVERS_JS) or []
+            except Exception:
+                return []
+
+        def apply_agg(label, sub, option, tag):
+            """agg 面板（达人画像 / 粉丝画像）里选一个子项值（用户 2026-09-17 追加）。
+
+            实测结构见 FIND_AGG_SUBSELECT_JS 上方注释。三步走：
+              ① 点开 label 面板（.quick-filter-button-agg-pop）
+              ② 点 sub 这一行的「请选择」→ 在弹出的下拉里点 option
+              ③ 点面板里的「确认」
+            **第③步不能省** —— 不点确认，面板收起后选择不会写进 payload。
+
+            这里只负责「点到」，真正的把关靠 verify_filters() 校验 payload
+            （author_gender / fans_gender）—— 点错了会在那一步被拦下并中止。
+            """
+            if not option or option in ("不限", "0", "off", "none"):
+                log("  [%s] 已关闭（option=%r），跳过" % (tag, option))
+                return True
+            for attempt in range(3):
+                if not close_dropdowns():
+                    log("  [%s] 警告：仍有下拉没关掉，继续尝试" % tag)
+                box = page.evaluate(FIND_FORMITEM_JS, label)
+                if not box:
+                    log("  [%s] 未找到筛选项 %s（第%d/3次）" % (tag, label, attempt + 1))
+                    time.sleep(1.2)
+                    continue
+                click_box(box)                       # ① 打开 agg 面板
+                time.sleep(1.6)
+
+                sel = page.evaluate(FIND_AGG_SUBSELECT_JS, sub)
+                if not sel:
+                    log("  [%s] 面板里没找到子项 %s（第%d/3次）" % (tag, sub, attempt + 1))
+                    _dump_agg(tag)
+                    close_dropdowns()
+                    time.sleep(1.5)
+                    continue
+                click_box(sel)                       # ② 展开该子项的下拉
+                time.sleep(1.4)
+
+                opt = page.evaluate(FIND_SELECT_OPTION_JS, option)
+                if not opt:
+                    # 兜底：用通用「可见浮层里找文本」的老选择器
+                    try:
+                        cands = page.evaluate(FIND_POPOVER_OPTION_JS, option) or []
+                    except Exception:
+                        cands = []
+                    if cands:
+                        cands.sort(key=lambda c: (c["y"], c["x"]))
+                        opt = cands[0]
+                        log("  [%s] 下拉项没精确命中，改用浮层兜底：cls=%s @(%s,%s)"
+                            % (tag, opt.get("cls"), opt["x"], opt["y"]))
+                if not opt:
+                    log("  [%s] 下拉里没有选项 %s（第%d/3次）；可见浮层=%s"
+                        % (tag, option, attempt + 1,
+                           [d["text"][:60] for d in _pop_texts()[:4]]))
+                    _dump_agg(tag)
+                    close_dropdowns()
+                    time.sleep(1.5)
+                    continue
+                click_box(opt)                       # ②b 选中
+                time.sleep(1.0)
+
+                btn = page.evaluate(FIND_AGG_BTN_JS, "确认")
+                if not btn:
+                    log("  [%s] 面板里没找到「确认」按钮（第%d/3次）" % (tag, attempt + 1))
+                    _dump_agg(tag)
+                    close_dropdowns()
+                    time.sleep(1.5)
+                    continue
+                click_box(btn)                       # ③ 确认
+                time.sleep(1.5)
+                shown = page.evaluate(FORMITEM_TEXT_JS, label)
+                log("  [%s] %s -> %s 已确认（回显: %s）" % (tag, sub, option, shown))
+                return True
+            return False
+
         def _filt_bad(filt):
             """检查一份 payload filters 是否满足当前全部筛选要求，返回问题列表。"""
             bad = []
@@ -1144,10 +1624,25 @@ def main():
                 bad.append("%s=%s(期望['%s'])" % (FANS_FIELD, got_fans, want_fans))
             if not filt.get(CONTACT_FIELD):
                 bad.append("%s=%s(期望非空)" % (CONTACT_FIELD, filt.get(CONTACT_FIELD)))
-            want_cate = CATE_ID_BY_NAME.get(CATE_PARENT)
-            got_cate = [str(x) for x in (filt.get(CATE_FIELD) or [])]
-            if want_cate and (not got_cate or got_cate[0] != want_cate):
-                bad.append("%s=%s(期望%s)" % (CATE_FIELD, got_cate, want_cate))
+            # 类目：**只有开了平台侧筛选才校验**（用户 2026-09-17 起默认不在平台筛类目，
+            # 改由本地规则4 `cate_verdict(author_tag.main_cate)` 按列表里的类目标签挑人）
+            if PLATFORM_CATE_FILTER:
+                want_cate = CATE_ID_BY_NAME.get(CATE_PARENT)
+                got_cate = [str(x) for x in (filt.get(CATE_FIELD) or [])]
+                if want_cate and (not got_cate or got_cate[0] != want_cate):
+                    bad.append("%s=%s(期望%s)" % (CATE_FIELD, got_cate, want_cate))
+            # 达人画像 -> 达人性别 = 女（2026-09-17 追加）
+            if PORTRAIT_OPTION and PORTRAIT_OPTION not in ("不限", "0", "off", "none"):
+                got_p = [str(x) for x in (filt.get(PORTRAIT_FIELD) or [])]
+                if PORTRAIT_VALUE not in got_p:
+                    bad.append("%s=%s(期望含'%s')" % (
+                        PORTRAIT_FIELD, got_p, PORTRAIT_VALUE))
+            # 粉丝画像 -> 粉丝性别 = 女性居多（2026-09-17 追加）
+            if FANS_GENDER_OPTION and FANS_GENDER_OPTION not in ("不限", "0", "off", "none"):
+                got_fg = [str(x) for x in (filt.get(FANS_GENDER_FIELD) or [])]
+                if FANS_GENDER_VALUE not in got_fg:
+                    bad.append("%s=%s(期望含'%s')" % (
+                        FANS_GENDER_FIELD, got_fg, FANS_GENDER_VALUE))
             return bad
 
         def verify_filters():
@@ -1409,22 +1904,28 @@ def main():
             sys.exit(3)          # 退出码 3 = 一直没登录上（驱动层应整体中止）
         log("登录态正常：%s" % login_why)
 
-        log("应用筛选：类目 = %s" % " > ".join("/".join(c) for c in CATES))
-        cate_ok = False
-        for parent, child in CATES:
-            cate_ok = apply_cate_cascade(parent, child) or cate_ok
-        if not cate_ok:
-            log("!! 类目筛选未生效 -> 中止本次采集（避免采到无关类目）")
-            try:
-                page.screenshot(path=os.path.join(OUT, "cate_fail.png"))
-            except Exception:
-                pass
-            time.sleep(2)
-            try:
-                ctx.close()
-            except Exception:
-                pass
-            sys.exit(2)          # 退出码 2 = 类目没选中（驱动层可重试）
+        # 🔴 用户 2026-09-17 起：**平台侧不筛类目**（主推类目留「全部」），
+        #    类目要求改由本地规则4 按列表里的类目标签挑人（见 PLATFORM_CATE_FILTER 注释）。
+        if PLATFORM_CATE_FILTER:
+            log("应用筛选：类目 = %s" % " > ".join("/".join(c) for c in CATES))
+            cate_ok = False
+            for parent, child in CATES:
+                cate_ok = apply_cate_cascade(parent, child) or cate_ok
+            if not cate_ok:
+                log("!! 类目筛选未生效 -> 中止本次采集（避免采到无关类目）")
+                try:
+                    page.screenshot(path=os.path.join(OUT, "cate_fail.png"))
+                except Exception:
+                    pass
+                time.sleep(2)
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+                sys.exit(2)      # 退出码 2 = 类目没选中（驱动层可重试）
+        else:
+            log("应用筛选：**平台侧不筛类目**（主推类目留「全部」）"
+                "-> 类目由本地规则4 按达人列表里的类目标签把关")
         # 用户 2026-09-16 改：结算总额 -> **直播结算总额 = 1w-10w**
         # 字段 common_range_selection_live_sales_30d_settle（只认直播带货的结算额）。
         # 单一选项，单选即可；要拼多档用 `|` 分隔（该下拉支持多选）。
@@ -1433,14 +1934,21 @@ def main():
             ok_sale = apply_formitem(SALE_LABEL, _opt, "sale") and ok_sale
         ok_fans = apply_formitem(FANS_LABEL, FANS_OPTION, "fans")
         ok_contact = apply_formitem("有联系方式", None, "contact")
+        # 用户 2026-09-17 追加两条（都要走 agg 面板三步：请选择 -> 选项 -> 确认）
+        #   ① 达人画像 -> 达人性别 = 女
+        #   ② 粉丝画像 -> 粉丝性别 = 女性居多
+        ok_portrait = apply_agg(PORTRAIT_LABEL, PORTRAIT_SUB, PORTRAIT_OPTION, "portrait")
+        ok_fansg = apply_agg(FANS_PROFILE_LABEL, FANS_GENDER_SUB,
+                             FANS_GENDER_OPTION, "fansg")
         time.sleep(4)
 
         # 🔴 筛选项只要有一个没应用成功，就**直接中止**，绝不继续采。
         #    踩过（2026-09-17）：「粉丝量」的点击被上一个字段的下拉浮层盖住，
         #    3 次尝试全失败，但脚本照样跑完，采出一批**没有粉丝量约束**的名单。
-        if not (ok_sale and ok_fans and ok_contact):
-            log("!! 筛选应用失败（sale=%s fans=%s contact=%s）-> 中止本次采集"
-                % (ok_sale, ok_fans, ok_contact))
+        if not (ok_sale and ok_fans and ok_contact and ok_portrait and ok_fansg):
+            log("!! 筛选应用失败（sale=%s fans=%s contact=%s portrait=%s fansg=%s）"
+                "-> 中止本次采集"
+                % (ok_sale, ok_fans, ok_contact, ok_portrait, ok_fansg))
             try:
                 page.screenshot(path=os.path.join(OUT, "filter_fail.png"))
             except Exception:
@@ -1697,10 +2205,13 @@ def main():
         seen, picked = set(), []
         stat = {"dup": 0, "male": 0, "region": 0, "noprov": 0, "settle": 0,
                 "nocate": 0, "catecombo": 0, "content": 0, "contentkeep": 0,
-                "nickkw": 0, "nickbrand": 0}
+                "nickkw": 0, "nickbrand": 0, "unauth": 0,
+                "z_nocate": 0, "z_single": 0}      # 分支 Z 的两个新判定结果
         nick_drop = []                  # 记录被昵称规则剔除的样本，便于核对
         content_drop = []               # 记录被内容类型剔除的样本（新规则上线后要能核对）
+        cate_drop = []                  # 记录被类目规则剔除的样本（A 的 nocate/catecombo、Z 的两个）
         settle_drop = []                # 记录被规则2b（结算额兜底）剔除的样本
+        unauth_drop = []                # 规则2c：因「未授权数据 + 等级够」被放行的样本
         for r in rows:
             k = norm_name(r["nickname"])
             if not k or k in seen:
@@ -1717,28 +2228,47 @@ def main():
                 stat["noprov"] += 1
                 continue
             # 规则2b：本地兜底过滤「直播结算总额」（平台侧筛选不严格，见文件头说明）
+            # 规则2c：读不到结算额（未授权数据）但等级 >= UNAUTH_LEVEL_MIN -> 放行
             if LOCAL_SETTLE_FILTER:
                 _ok, _note = settle_ok(r["live_low"], r["live_high"])
                 if not _ok:
-                    stat["settle"] += 1
-                    if len(settle_drop) < 40:
-                        settle_drop.append("%s(live=%s)" % (
-                            (r["nickname"] or "")[:16], _note))
-                    continue
+                    if (settle_unreadable(r["live_low"], r["live_high"])
+                            and level_ok(r.get("level"))):
+                        r["unauth_pass"] = "结算额未授权·LV%s" % r.get("level")
+                        stat["unauth"] += 1
+                        if len(unauth_drop) < 40:
+                            unauth_drop.append("%s(LV%s)" % (
+                                (r["nickname"] or "")[:16], r.get("level")))
+                    else:
+                        stat["settle"] += 1
+                        if len(settle_drop) < 40:
+                            settle_drop.append("%s(live=%s)" % (
+                                (r["nickname"] or "")[:16], _note))
+                        continue
             # 规则4：主推类目 —— 命中「个护家清/美妆」其一；
             #        目标词条命中 >=2 个 -> 第三个及以后的类目不做限制；
             #        仅命中 1 个 -> 才查 18 项搭档排除表
             mc = r.get("main_cate") or []
-            ok_cate, cate_hits, why = cate_verdict(mc)
+            ct = r.get("content_type") or []
+            if FILTER_PROFILE == "Z":
+                # 【分支 Z】主词条/副词条/第二个词条 那套口径（见文件上方 Z2~Z5）
+                ok_cate, cate_hits, why = z_verdict(mc, ct)
+            else:
+                ok_cate, cate_hits, why = cate_verdict(mc)
             if not ok_cate:
                 stat[why] += 1
+                if len(cate_drop) < 40:
+                    cate_drop.append("%s(%s | %s)" % (
+                        (r["nickname"] or "")[:14], "/".join(mc), "/".join(ct)))
                 continue
             r["cate_hits"] = cate_hits
-            # 规则6：内容类型 —— **白名单优先**（用户 2026-09-17 改）
-            #   命中 CONTENT_KEEP 任一项 -> 直接保留，不再看黑名单。
-            #   例：「时尚+美食」以前被「美食」误杀，现在因为含「时尚」而保留。
-            ct = r.get("content_type") or []
-            if any(c in CONTENT_KEEP for c in ct):
+            r["filter_profile"] = FILTER_PROFILE
+            # 规则6：内容类型
+            #   A 分支：白名单优先，未命中白名单时看黑名单
+            #   Z 分支：默认**不套黑名单**（内容类型已在 z_verdict 的 Z4b 把关）
+            if FILTER_PROFILE == "Z" and not Z_CONTENT_BLACKLIST:
+                pass
+            elif any(c in CONTENT_KEEP for c in ct):
                 stat["contentkeep"] += 1
             elif any(c in CONTENT_EXCLUDE for c in ct):
                 stat["content"] += 1
@@ -1757,21 +2287,39 @@ def main():
                 continue
             seen.add(k)
             picked.append(r)
+        log("  筛选口径：分支 %s%s" % (
+            FILTER_PROFILE,
+            "（主词条 个护家清/美妆；副词条 服饰内衣/母婴宠物/滋补保健 随意；"
+            "只含一个主词条时内容类型需命中 %s）" % "/".join(Z_SINGLE_CONTENT)
+            if FILTER_PROFILE == "Z" else "（历史规则）"))
         log("  本地过滤：重复 %d / 非女性 %d / 敏感地区 %d / 非大陆 %d "
             "/ 结算额不合格 %d / 无目标类目 %d / 排除类目组合 %d / 排除内容类型 %d "
             "/ 昵称排除词 %d / 昵称品牌 %d -> 保留 %d" % (
                 stat["dup"], stat["male"], stat["region"], stat["noprov"],
                 stat["settle"], stat["nocate"], stat["catecombo"], stat["content"],
                 stat["nickkw"], stat["nickbrand"], len(picked)))
+        if UNAUTH_LEVEL_MIN > 0:
+            log("  规则2c 未授权放行：结算额读不到 且 等级>=LV%d -> 放行 %d 个"
+                % (UNAUTH_LEVEL_MIN, stat["unauth"]))
+            if unauth_drop:
+                log("  未授权放行样本：%s" % " | ".join(unauth_drop))
         if LOCAL_SETTLE_FILTER:
             log("  规则2b 结算额兜底：%s = %s-%s（平台侧筛选不严格，本地再拦一道）"
                 % (SALE_LABEL, SETTLE_MIN, SETTLE_MAX))
         else:
             log("  规则2b 结算额兜底：已关闭（LOCAL_SETTLE_FILTER=0）")
-        log("  内容类型白名单（%s）另有 %d 个达人被明确保留"
-            % ("/".join(CONTENT_KEEP), stat["contentkeep"]))
+        if FILTER_PROFILE == "Z":
+            log("  分支Z 类目判定：无主词条(z_nocate) %d 个 / 只含单主词条且内容类型不达标(z_single) %d 个"
+                % (stat["z_nocate"], stat["z_single"]))
+            log("  分支Z 内容类型黑名单：%s"
+                % ("已启用（Z_CONTENT_BLACKLIST=1）" if Z_CONTENT_BLACKLIST else "已关闭（只在单主词条场景看内容类型）"))
+        else:
+            log("  内容类型白名单（%s）另有 %d 个达人被明确保留"
+                % ("/".join(CONTENT_KEEP), stat["contentkeep"]))
         if settle_drop:
             log("  结算额被剔除样本：%s" % " | ".join(settle_drop))
+        if cate_drop:
+            log("  类目被剔除样本：%s" % " | ".join(cate_drop))
         if nick_drop:
             log("  昵称被剔除样本：%s" % " | ".join(nick_drop))
         if content_drop:
@@ -1941,6 +2489,26 @@ def main():
                                             i, cand_n, nick18, scnt, MIN_SHOP_CNT,
                                             "：" + "/".join(slist[:3])))
                                     break
+                                # --- 规则3f（分支 Z）：单一店铺占所带商品 >=50% -> 跳过 ---
+                                # 用户 2026-09-19 追加：「同一个店铺的商品超过 50%，
+                                # 一个店铺占据了 50% 的品的，不做添加」
+                                shskip, shratio, shname, shtotal, shcnt = \
+                                    False, 0.0, "", 0, 0
+                                if FILTER_PROFILE == "Z":
+                                    shskip, shratio, shname, shtotal, shcnt = \
+                                        shopshare_verdict(shops)
+                                    r["top_shop"] = shname
+                                    r["top_shop_ratio"] = round(shratio, 3)
+                                    r["top_shop_cnt"] = shcnt
+                                    if shskip:
+                                        r["skip_reason"] = "单店铺%.0f%%:%s" % (
+                                            shratio * 100, shname)
+                                        verdict_cache[r["uid"]] = "skip"
+                                        log("   [%d/%d] %-20s 同一店铺「%s」占 %.0f%%"
+                                            "（%d/%d 件，>=%.0f%%）-> 跳过该达人" % (
+                                                i, cand_n, nick18, shname, shratio * 100,
+                                                shcnt, shtotal, SHOP_SHARE_RATIO * 100))
+                                        break
                                 if skip:
                                     r["skip_reason"] = "带货同源%.0f%%:%s" % (ratio * 100, brand)
                                     verdict_cache[r["uid"]] = "skip"
@@ -1959,9 +2527,10 @@ def main():
                                     log("   [%d/%d] %-20s 昵称含带货品牌「%s」-> 跳过" % (
                                         i, cand_n, nick18, bhit))
                                     break
-                                log("   [%d/%d] %-20s 店铺 %d 家 / 多家品牌（最大仅 %.0f%%）"
-                                    " -> 继续查联系方式" % (
-                                        i, cand_n, nick18, scnt, ratio * 100))
+                                log("   [%d/%d] %-20s 店铺 %d 家（最大「%s」%.0f%%）"
+                                    " / 品牌最大 %.0f%% -> 继续查联系方式" % (
+                                        i, cand_n, nick18, scnt, shname or "-",
+                                        shratio * 100, ratio * 100))
                             else:
                                 # 用户要求：带货分析这一步必须真正执行 ——
                                 # 拿不到商品数据就无法判定，不能直接进入下一步，只能换人

@@ -71,6 +71,29 @@ SETTLE_CASES = [
     ("10000", "25000", True),    # 字符串数字 -> 按数字比
 ]
 
+# 规则2b 取区间用的 settle_pair(rec) —— 2026-09-22 新增：
+#   复核/回收/救急三个脚本都靠它从「名单记录」里取 (low, high)。
+#   归档里的存档形态不统一（341 条里 251 条是扁平 live_low/high、64 条只有
+#   settle_live={low,high}、26 条两者都没有），不兼容就会把 64 条误判成「无数据」。
+SETTLE_PAIR_CASES = [
+    # (记录, 期望 (low, high))
+    ({"live_low": 10000, "live_high": 25000}, (10000, 25000)),          # 扁平字段优先
+    ({"settle_live": {"low": 10000, "high": 25000}}, (10000, 25000)),   # 回退 settle_live
+    ({"live_low": None, "live_high": None,
+      "settle_live": {"low": 25000, "high": 50000}}, (25000, 50000)),   # 扁平是 None -> 回退
+    ({"live_low": 10000, "live_high": None}, (10000, None)),            # 半个扁平 -> 原样传出
+    ({"settle_live": {"low": None, "high": None}}, (None, None)),
+    ({}, (None, None)),                                                 # 09-15 那批（只有 video_*）
+]
+
+# settle_pair 的取值还要能直接喂给 settle_ok（端到端：复核脚本的判定链）
+SETTLE_PAIR_FLOW = [
+    ({"settle_live": {"low": 25000, "high": 50000}}, True),    # 只有 settle_live，且合规
+    ({"settle_live": {"low": 0, "high": 0}}, False),           # 只有 settle_live，0-0 要拦
+    ({"live_low": 5000, "live_high": 10000}, False),           # 扁平，越界
+    ({}, False),                                               # 两者都没有 -> 未判定 -> 剔除
+]
+
 
 def main():
     bad = 0
@@ -99,7 +122,25 @@ def main():
             "PASS" if good else "FAIL", lo, hi, ok, note,
             C.SETTLE_MIN, C.SETTLE_MAX))
     print("-" * 78)
-    total = len(CATE_CASES) + len(PRODUCT_CASES) + len(SETTLE_CASES)
+    for rec, want in SETTLE_PAIR_CASES:
+        got = C.settle_pair(rec)
+        good = (got == want)
+        if not good:
+            bad += 1
+        print("%s  settle_pair(%-52s) -> %s" % (
+            "PASS" if good else "FAIL", str(rec)[:50], got))
+    print("-" * 78)
+    for rec, want_ok in SETTLE_PAIR_FLOW:
+        lo, hi = C.settle_pair(rec)
+        ok, note = C.settle_ok(lo, hi)
+        good = (ok == want_ok)
+        if not good:
+            bad += 1
+        print("%s  settle_pair -> settle_ok(%-40s) -> ok=%-5s note=%s" % (
+            "PASS" if good else "FAIL", str(rec)[:38], ok, note))
+    print("-" * 78)
+    total = (len(CATE_CASES) + len(PRODUCT_CASES) + len(SETTLE_CASES)
+             + len(SETTLE_PAIR_CASES) + len(SETTLE_PAIR_FLOW))
     print("失败 %d 项" % bad if bad else "全部通过（%d 组用例）" % total)
     return 1 if bad else 0
 

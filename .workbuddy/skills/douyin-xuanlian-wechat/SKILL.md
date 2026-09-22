@@ -46,7 +46,11 @@ export PATH="/c/Users/<你>/.workbuddy/binaries/PortableGit/versions/1.2.0/cmd:\
 | 脚本 | 用途 |
 |---|---|
 | `tools/env.sh` | `source` 后导出 `$PY/$PYTHONPATH/$GIT`，跨机器可移植 |
+| `tools/kill_edge.sh` | **采集前必跑**：清掉占着 `.edge-auto/profile` 的残留 Edge（2026-09-19 新增，见 §6 排错表首行） |
 | `tools/run_b_rounds.sh` | 阶段B 连跑（一直加到风控/候选加完），见 §3 |
+| `tools/collect_more.py` | **阶段A 多轮累积采集**：反复跑 `collect.py`，按「台账里没有的微信号」去重攒够 N 个，自动合并回 `darens.json`。见 §2.1 |
+| `tools/salvage_scan.py` | **候选池告急时的回收器**：扫 `out/collect/**/*.json`（含 `archive/`），捞出「有微信 + 不在台账 + 通过当前全部规则」的达人。`--merge` 直接并入名单（不重开浏览器）。见 RUNBOOK §3.2.2 |
+| `tools/z_recheck.py` | **Z 口径复核器**：用当前规则（Z 类目 + 3a/3b/3c/3d/**3f** + 规则7）重筛 `darens.json`。`--drop` 摘掉不合格项。**规则改动后、跑阶段B 前必做**。见 RUNBOOK §3.2.2 |
 | `tools/check_js.py` | 把 .py 里 Playwright 用的 JS 负载抠出来做 `node --check`，见 §7 |
 
 ## 1. 触发词 → 立即动作
@@ -114,11 +118,30 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
    > 深度沿革：2026-09-17 用户反馈「有很多时尚的、符合类目的，均未筛选到」，
    > 排查发现候选池 104 个只处理了 22 个就凑满 15 个停了 → 改为**每批 30**
    > （约扫 40-60 个候选，耗时翻倍）。想浅采集：`GHQ_TARGET=15 MZ_TARGET=15`。
+   >
+   > 🔴 **2026-09-17 起「平台侧不再筛类目」**（用户原话：「在主推类目中，不对类目进行筛选，
+   > 只在下方查看达人时，选择之前所要求的类目达人」）→ 主推类目留「**全部**」，
+   > 类目改由**本地规则4** 按达人列表里每行显示的类目标签把关（必须含个护家清或美妆）。
+   > 因此**两批的候选基本重合**，去重后 ≈ 一份名单。`PLATFORM_CATE_FILTER=1` 可恢复旧行为。
+   >
+   > 平台侧**新增两条**（都走 agg 面板三步：**请选择 → 选项 → 确认**，少点「确认」不生效）：
+   > `达人画像 → 达人性别 = 女`（`author_gender:["2"]`）、
+   > `粉丝画像 → 粉丝性别 = 女性居多`（`fans_gender:["2"]`）。
+   > ⚠️ 平台文案是「**女**」不是「女性」；面板里**没有**「女」这个字，别用文本找。
+   > 关掉：`PORTRAIT_OPTION=` / `FANS_GENDER_OPTION=`（设为空或「不限」）
 
 2. **盯进度**：`out/collect_30.log`、`out/collect_ghq.log`、`out/collect_mz.log`。
    每批取满目标有效达人（成功取到联系方式）自动停。
    看到「当前未登录精选联盟」→ **提醒用户去 Edge 窗口里登录**。
    ⚠️ 筛完必须看到 `[verify] 接口校验通过` 那行；没看到或报错就是筛选没生效。
+   通过时 payload 形如（`main_cate_new` 只在 `PLATFORM_CATE_FILTER=1` 时才出现）：
+   ```
+   [verify] 接口校验通过：{"common_range_selection_live_sales_30d_settle":["2"],
+            "fans_num":["1"], "has_contact":["true"],
+            "author_gender":["2"], "fans_gender":["2"]}
+   ```
+   （`author_portrait` / `fan_portrait` 上的 `["undefined"]` 是**平台自己加的父级占位键**，
+     **无害**，实测列表照常返回数据，别当 bug 去"修"。）
 
    🔴 **平台侧「直播结算总额」筛选不严格（2026-09-17 实测）**：
    `[verify]` 通过 ≠ 平台真的按区间给数据。实测个护家清批次
@@ -132,6 +155,15 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
    本地过滤：... / 结算额不合格 15 / ...
    ```
    （两个数不一定相等 —— 规则2b 只统计「走到它那一步」的达人。）
+   ⚠️ **唯一的例外口子 = 规则2c**（2026-09-19 用户定）：结算额**读不到数值**（未授权数据）
+   且等级 ≥ `UNAUTH_LEVEL_MIN`（默认 **2**）→ 放行。所以「直播结算总额 1-10w」并非绝对严格；
+   要一个都不放过就 `export UNAUTH_LEVEL_MIN=0`。日志会打「规则2c 未授权放行 … 放行 N 个」。
+   🔴 **「结算额 1w-10w」在三条支路上都要守**（2026-09-22 补齐）：除主流程 `collect.py` 外，
+   **回收 `tools/salvage_scan.py`（`--merge` 直接写名单）/ 复核 `tools/z_recheck.py`（`--drop`）/
+   救急重建 `.probe/build_candidates_from_archive.py`（`--write`）** 也会写出或改写
+   `darens.json`，而它们原先**都漏了结算额关卡**（实测归档 331 条里 **50 条越界**会被放进名单）。
+   现全部复用 `collect.settle_ok/settle_unreadable/level_ok`，取区间统一用
+   **`collect.settle_pair(rec)`**（先扁平 `live_low/high`，回退 `settle_live={low,high}`）。
 
 3. **产出**：`out/collect/darens.xlsx`（7 列登记表）+ `darens.json` / `darens.csv`。
 
@@ -140,11 +172,24 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 | 码 | 含义 | 动作 |
 |---|---|---|
 | 0 | 正常 | 读 `darens_<tag>.json` |
-| 2 | 类目按钮没点到 | 冷却 `CATE_RETRY_WAIT`（45s）重试 |
+| 2 | 类目按钮没点到 / **任一筛选项没应用成功或 payload 校验没过** | 冷却 `CATE_RETRY_WAIT`（45s）重试。⚠️ 改筛选改错了会**自动中止**，不会产出脏数据 |
 | 3 | 等满 `LOGIN_WAIT_SEC` 仍没登录 | **中止全流程**；调大 `LOGIN_WAIT_SEC` 或先跑可选辅助 `login.py` |
 
 **筛选条件与业务规则**：全部见 `RUNBOOK.md` 第 2 节（含 7 条规则、接口字段对照、
 结算类字段表、内容类型 40 项、昵称排除三层词表）。
+
+**⭐ 两套筛选口径（2026-09-19 新增）**：`FILTER_PROFILE=Z`（**现为默认**，
+用户 2026-09-19 定调「默认按分支 Z，不用再问」）/ `FILTER_PROFILE=A`（历史规则，仅回溯用）。
+- Z = 主词条 个护家清·美妆 + 副词条随意；单主词条时内容类型须命中
+  `时尚/情感/剧情/颜值/音乐/舞蹈/亲子`
+- Z 追加**规则3f**：达人主页带货分析里，**单一店铺占所带商品 ≥50%（且件数严格过半）→ 跳过**
+  （函数 `collect.py::shopshare_verdict()`，阈值 `SHOP_SHARE_RATIO`，仅 Z 下生效）
+- 判定函数 `collect.py::z_verdict()`（纯函数，返回 `z_nocate` / `z_single`）
+- `tools/collect_more.py` 会**透传**该变量，驱动日志打印「筛选口径：分支 Z」
+- 完整口径 + 页面标签速查表见 `RUNBOOK.md` §1.6；自查脚本 `tools/_z_check.py`、
+  `tools/_rule3f_test.py`
+- ⚠️ Z 放宽后单轮候选会暴涨（实测 1216 达人 → 600 候选），耗时显著变长
+
 改规则时改 `collect.py` 顶部的常量区（`CATE_*` / `SALE_*` / `*_EXCLUDE_*` /
 `SAME_BRAND_RATIO` / `TARGET_DAREN` / `MIN_SHOP_CNT` / `CHEAP_PRICE` / `CHEAP_RATIO`），
 **不要**散落在逻辑里。
@@ -155,11 +200,14 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
   → 所以抽成**无副作用的独立模块**（纯数据 + 纯函数）。
 - 为什么 B/C 也要挡：`out/collect/darens.json` 是**上一次 A 跑出来的旧名单**，
   不会自动重筛。旧名单里可能有后来才被拉黑的词（如「香港」「源头」）。
-- 现有词表（**23 个**）：国际/全球/美业/供应链/折扣/厂家/大牌/养发/集团/防晒
+- 现有词表（**28 个**）：国际/全球/美业/供应链/折扣/厂家/大牌/养发/集团/防晒
   + 香港/工厂直销/找工作/智慧服务/假发/美甲/酒/染发/男士/妇炎洁
-  + **睫毛/香水/源头**（2026-09-17 后两批追加）
+  + 睫毛/香水/源头（2026-09-17 后两批追加）
+  + **专场/品牌/植发/工厂/草本**（2026-09-19 分支 Z 追加；其中 香港/供应链/折扣/
+    养发/美甲/睫毛 原本就在表内，本次实际新增 5 个）
 - ⚠️ 已知偏宽、用户明确接受的误伤：`酒`(酒精/酒店) / `男士`(女性达人的男士品类号) /
-  `源头`(含此二字一律排除) / `睫毛`/`香水`
+  `源头`(含此二字一律排除) / `睫毛`/`香水` / `品牌`(自称「品牌好物」的正规号) /
+  `草本`(「草本护肤」这类正经个护号) / `工厂`(「工厂店」，本就要排除)
 - 想临时换词表：`export NICK_EXCLUDE_KW="词1,词2"`（**整体覆盖**，不是追加）
 
 **取「达人抖音号」（阶段C 要用）—— `douyin_id.py`**
@@ -205,6 +253,45 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 - ⚠️ **别用裸 `3C` 当关键词**：它是美妆品牌「3CE」的子串，会误杀正规美妆达人。
 - ⚠️ `r["shop_rows"]` 是**商品件数**，`r["shop_cnt"]` 才是**店铺家数**，别混用。
 - ⚠️ 商品表**分页**（首页约 15 行）→ 四条规则都只在首页样本上判定。
+
+## 2.1 候选不够时：多轮累积采集 `tools/collect_more.py`（2026-09-18 新增）
+
+🔴 **重要事实：接口返回的候选「排序/切片」在两次会话之间会变。**
+
+实测同一套筛选条件（直播结算额 1w-10w / 粉丝 10w 以下 / 有联系方式 / 女 / 女性粉丝）：
+- 15:01 那轮：去重后 **1134** 个达人 → 本地过滤后**保留 127** 个候选；
+- 17:19 那轮：去重后 **933** 个达人 → 本地过滤后**只保留 5** 个。
+（`无目标类目` 计数两轮都是 840+，说明候选池主体重合，但**进入候选的那一小撮完全不同**。）
+
+结论：**单轮采集永远拿不全**。要凑够一批候选只能反复采，每轮取「新增」那部分。
+
+```bash
+# 攒够 25 个「台账里没有的微信号」达人（最多 8 轮，每轮 TARGET_DAREN=62）
+"$PY" tools/collect_more.py
+"$PY" tools/collect_more.py --target 20 --rounds 6      # 或显式传参
+"$PY" tools/collect_more.py --dry                       # 只看台账/名单现状，不采集
+```
+
+- 去重口径 = **`contact` 不在 `out/wechat/add_results.json` 台账里**（重复加没意义），
+  同时按 `uid` 与现有 `darens.json` 去重。
+- 全部轮次跑完后**合并写回 `darens.json`**（原名单 + 新达人，按 uid 去重），
+  所以跑完直接 `wechat_add.py status` → `tools/run_b_rounds.sh` 即可。
+- 命中限流（本轮 0 产出）会退避 `MORE_RATE_WAIT`（默认 120 秒）后继续；
+  ⚠️ 但**「0 产出」有两种原因**：真限流（`11001`）和**上一轮的 Edge 没退干净**
+  （`TargetClosedError` + 「正在现有浏览器会话中打开」）。驱动把两者都写成
+  「本轮 0 产出（很可能平台限流）」，**容易带偏排查方向** → 一定去看单轮日志
+  `out/collect_moreN.log` 的尾部确认到底是不是 11001。
+  （2026-09-19 起 `run_pass()` 已内置 `kill_edge()`，每轮开跑前先清 Edge，这一类已基本消除。）
+  连续 3 轮无新增就停（判定切片遍历完）。
+- ⚠️ **`collect.py` 每轮都从候选列表顶部重新走一遍**，已处理过的达人会被重复采集
+  （约 7-8 分钟/轮的纯浪费）——目前靠本驱动的台账去重兜住，**没有**在采集器里加跳过逻辑。
+- 环境变量：`MORE_TARGET_NEW` / `MORE_ROUNDS` / `MORE_TARGET_DAREN` / `MORE_ROUND_GAP` / `MORE_RATE_WAIT`。
+
+**平台限流（11001）的恢复窗口实测**：16:04 命中 → 16:29 已恢复（≈25 分钟）。
+症状永远是列表渲染成「未找到相关达人，请调整筛选后重试」且 `search_feed_author`
+接口 **0 条响应**（日志里是「累计接口响应 0 条」）。
+⚠️ 此时**不要**改筛选逻辑去"修"，等窗口过去即可；用户若说「不要等」，
+就把每轮 `TARGET_DAREN` 调小、靠多轮循环撞窗口，别原地 sleep。
 
 ## 3. 阶段B：微信加好友
 
@@ -298,6 +385,25 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 所以 `status` 报的「剩余待加」和 `run` 实际处理数**是一致的**，不会再出现
 「status 说 25 个、run 只加 22 个」的迷惑现象。
 
+### 3.4.1 ⭐ 「加到 N 个为止」时的补发轮（2026-09-19 实测，详见 `RUNBOOK.md` §3.9）
+
+主轮跑完通常差几个，要补发。三个必知点：
+
+1. **`--limit` 按「还差几个」取，别给余量**。尾部候选成败率波动极大
+   （实测一轮 `4 not_found / 2 sent`，下一轮 `sent 4/4`）→ 差 1 个就写 `--limit 1`。
+   09-19 因为差 1 个却给了 `--limit 4`，**当日多发 3 个**。
+2. **整轮全 `error`/`unknown` + `cannot write empty image`** = 上一轮遗留的
+   「申请添加朋友」窗口 rect 变 0×0。处置：枚举该标题窗口并发 `WM_CLOSE`(0x0010)，再重跑。
+   ⚠️ 校验窗口时 `window_rect(hwnd)` **必须传 hwnd** —— 漏参抛 `TypeError` 会中断
+   后面的窗口枚举，看起来像「窗口全没了」，极易误判成别的故障。
+3. **「当天已发几个」= 台账 `sent` 总数 − 当日基线**。台账**没有时间字段**，
+   基线只能靠「开跑前的 sent 总数」记下来（09-19 基线 = 166）。
+
+🔴 **单会话铁律（2026-09-19 踩坑）**：同一条流水线**同一时间只能有一个会话在跑**。
+两个会话会抢同一个 `.edge-auto/profile` 与 `darens.json`，互相杀对方的 python/msedge，
+而且**阶段A 与阶段B 并行本身就是禁止的**（B 用桌面区域截图，A 会把 Edge 拉到最前 →
+B 拍到 Edge → 误判 `risk_control` 整轮中止 / `not_found` 永久跳过该达人）。
+
 ## 3.5 阶段C：登记到飞书多维表格 —— `feishu_sync.py`
 
 **触发**：跑完 A 之后跑一次；跑完 B 之后再跑一次（更新「状态」列）。
@@ -312,8 +418,12 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 
 - 目标表：Base `DgCobcJykajunKsMcUXcZdOnnXd` / Table `tblHE06hIkZxnafa`（表名 `达人统计`）。
   ⚠️ 该 Base 里**有两张表**，别写错；`达人统计` 里原有 **10 条示例数据**，不是真达人。
-- 列：达人名称 / 达人抖音号 / 粉丝数 / 结算总额 / 直播结算总额 / 短视频结算总额 /
-  所属平台 / 状态。缺的列脚本**幂等自动创建**。
+- 列：达人名称 / 达人抖音号 / **达人微信号** / 粉丝数 / 结算总额 / 直播结算总额 /
+  短视频结算总额 / 所属平台 / 状态。缺的列脚本**幂等自动创建**。
+- **「达人微信号」只填微信号**（`contact_type == 微信`），手机号达人不填 —— 与 Excel 登记表口径一致。
+  用户 2026-09-19 新增此列，脚本会**自动回补历史行**：表内已有但该列为空的行，
+  按「达人名称」匹配 B 阶段台账 `add_results.json` 补上（只 update、不新增行、不覆盖手填值）；
+  `--no-backfill` 可关掉。实测 131 行回补 120 行，剩 11 行是手机号达人（本该留空）。
 - **幂等键 = 达人名称**：同名走 update（只提交有值且有变化的列），不重复建行。
 - **状态映射**（用户只要两个值，不写失败原因）：
   `sent`/`already` → **已申请**；`not_found`/`excluded` → **添加失败**；
@@ -391,6 +501,10 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 
 | 症状 | 真因 / 动作 |
 |---|---|
+| 🔴 **采集秒退（0.0 分钟、退出码 1、日志几乎空白）**，尾部 `TargetClosedError` + 「**正在现有浏览器会话中打开**」 | **`.edge-auto/profile` 被残留的 msedge 占着**，不是限流！跑 `bash tools/kill_edge.sh && "$PY" tools/collect_more.py`（杀完**立刻**启动，别 sleep）。详见 RUNBOOK §1.5 |
+| 🔴 上面那种「秒退」被 `collect_more` 记成「本轮 0 产出（很可能平台限流）」 | 驱动把「非 0 退出 + 0 产出」统一归因为限流，**会误导排查方向** → 先去看单轮日志 `out/collect_moreN.log` 尾部到底是不是 `11001` |
+| 之前明明加了 `kill msedge` 却还是占着 | **`taskkill //F //IM …` 双斜杠是无效参数、静默失败**（`tasklist //fi … \\| wc -l` 还会输出 0，看着像清干净了）→ 一律用**单斜杠** |
+| 杀完 msedge 等十几秒再启动，反而失败 | 实测**杀掉约 15 秒后 Edge 会自己带会话重启**、又占住 profile → 正确姿势是「归零就立刻启动」 |
 | 日志出现「当前未登录精选联盟」 | **正常等待态**，不是报错 → 它已自动打开登录页，让用户去那个 Edge 窗口登录；等满 `LOGIN_WAIT_SEC` 会退出码 3 |
 | 等满仍没登录 | 用户在机器旁吗？加大 `LOGIN_WAIT_SEC` 重跑；诊断截图看 `out/collect/need_login*_*.png` / `login_timeout*_*.png` |
 | 「未找到类目按钮」 | ①页面布局变化 ②极少数情况下登录态判定漏判 → 看 `out/collect/need_login*.png` |
@@ -398,7 +512,8 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 | 每个达人主页都报 `Execution context was destroyed` | 浏览器假死（常见于系统休眠后）→ 脚本会自动 `restart_browser()`；**但重启不恢复登录** |
 | 列表只滚出几条就没新增 | 滚动容器选错 / 懒加载 → 见 RUNBOOK「列表翻页」 |
 | 日志出现「下拉里没有 10w以下」/ 某筛选项连试 3 次全败 | **下拉浮层盖住了下一行的筛选项** → 已修：`apply_formitem` 每次点击前 `close_dropdowns()`，选完校验回显，失败直接退出码 2。详见 RUNBOOK「筛选浮层遮挡」 |
-| 筛选项「显示成功」但采集结果不对 | 别再信 UI 日志 —— 看 `[verify] 接口校验通过` 那行；脚本现在会用 `search_feed_author` 的 payload 核对类目/结算/粉丝量/联系方式，不符就中止 |
+| 筛选项「显示成功」但采集结果不对 | 别再信 UI 日志 —— 看 `[verify] 接口校验通过` 那行；脚本现在会用 `search_feed_author` 的 payload 核对结算/粉丝量/联系方式/达人性别/粉丝性别，不符就中止 |
+| 日志「`[portrait]`/`[fansg]` 连试 3 次全败」或「面板里没找到子项」 | **agg 面板三步没走全**（达人画像/粉丝画像）。要点：面板里的「请选择」→ 下拉选项 → **面板里的「确认」**；少点「确认」不生效。失败日志会 dump 面板每行的「标签 → 当前值」，照它改选择器。面板里**没有**「女」这个字，别用文本找。见 RUNBOOK「agg 面板」一节 |
 | 想核对新带货规则拦了谁 | 看 `out/collect*.log` 里「带货规则跳过汇总」+ 每个达人的「到手价：n/N 件可解析，<30元 占 P%」；JSON 里有 `shop_cnt` / `price_cheap_ratio` |
 | 微信报 `找不到「添加朋友」窗口` | 用户没先打开「添加朋友」 |
 | 微信结果页识别不了 | 可能是风控弹窗遮挡 → 查 `risk_control` |
@@ -414,12 +529,15 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 
 诊断探针（`.probe/`）：`probe_login.py`、`probe_api.py <类目>`、
 `probe_daren.py [uid]`、`probe_product_price.py`（dump 带货分析整表含到手价）、
-`probe_filters.py <类目>`、`probe_douyin_id.py` / `probe_douyin_id2.py`（取抖音号，含串号证据）。
+`probe_filters.py <类目>`、`probe_douyin_id.py` / `probe_douyin_id2.py`（取抖音号，含串号证据）、
+`probe_square.py`（dump 达人广场页面结构，确认某控件**存不存在**）、
+`probe_portrait.py`（dump agg 面板真实 DOM）、
+`probe_agg.py`（用 `ast` 抠出 collect.py 的**真实** JS 常量跑 agg 三步，再核对 payload）。
 
 ## 7. 单测
 
 ```bash
-"$PY" .probe/test_rules.py      # 类目组合 + 禁忌商品名 + 规则2b结算额兜底（40 组）
+"$PY" .probe/test_rules.py      # 类目组合 + 禁忌商品名 + 规则2b结算额兜底 + settle_pair 存档兼容（50 组）
 "$PY" .probe/test_brand.py      # 带货同品牌占比判定（11 组）
 "$PY" .probe/test_new_rules.py  # 禁忌词 + 店铺家数 + 低价铺货 + 价格解析 + 养发占比(3e) + 纯数字昵称(7c)
 "$PY" -m py_compile douyin_id.py collect.py   # 语法自检

@@ -4,7 +4,13 @@
 用户要求：**每次跑完 A 阶段及 B 阶段后**，把达人信息登记到
     https://ecnu9txhl35c.feishu.cn/base/DgCobcJykajunKsMcUXcZdOnnXd
 表：`达人统计`（tblHE06hIkZxnafa）
-列：达人名称 / 达人抖音号 / 粉丝数 / 结算总额 / 直播结算总额 / 短视频结算总额 / 状态
+列：达人名称 / 达人抖音号 / **达人微信号** / 粉丝数 / 结算总额 / 直播结算总额 /
+    短视频结算总额 / 状态
+
+> 2026-09-19 用户要求：飞书表里新增了「**达人微信号**」列，后续统计达人时要把微信号填上。
+> 该列只填**微信号**（`contact_type == 微信`）；手机号达人不填（与 Excel 登记表口径一致）。
+> 另外脚本会自动**回补历史行**：表内已存在但该列为空的行，用 B 阶段台账按「达人名称」
+> 匹配后补上（只 update，绝不新增行）。`--no-backfill` 可关掉。
 
 数据来源（全部本地，不发任何额外请求）：
   out/collect/darens.json         —— A 阶段产出（含 contacts / 结算区间 / 抖音号）
@@ -22,10 +28,11 @@
 所以 A 跑完先登记一遍、B 跑完再跑一遍，不会产生重复行。
 
 用法：
-    "$PY" feishu_sync.py                 # 登记/更新（默认只登记有效达人）
+    "$PY" feishu_sync.py                 # 登记/更新（默认只登记有效达人，并回补「达人微信号」）
     "$PY" feishu_sync.py --dry           # 只打印将要写什么，不落库
     "$PY" feishu_sync.py --all           # 连未取到联系方式的也登记（一般不用）
     "$PY" feishu_sync.py --limit 5       # 只处理前 N 个（试跑）
+    "$PY" feishu_sync.py --no-backfill   # 不动历史行的「达人微信号」列
 """
 import argparse
 import glob
@@ -63,6 +70,7 @@ STATUS_MAP = {
 # 需要确保存在的字段（幂等创建）
 REQUIRED_FIELDS = [
     {"name": "达人抖音号", "type": "text"},
+    {"name": "达人微信号", "type": "text"},
     {"name": "结算总额", "type": "text"},
     {"name": "直播结算总额", "type": "text"},
     {"name": "短视频结算总额", "type": "text"},
@@ -70,6 +78,13 @@ REQUIRED_FIELDS = [
      "options": [{"name": "已申请", "hue": "Green", "lightness": "Lighter"},
                  {"name": "添加失败", "hue": "Red", "lightness": "Lighter"}]},
 ]
+
+
+def wx_of(rec):
+    """取达人的微信号；手机号达人不算（与 Excel 登记表口径一致）。"""
+    if rec.get("contact_type") != "微信":
+        return ""
+    return (rec.get("contact") or "").strip()
 
 
 def log(m):
@@ -221,7 +236,8 @@ def build_rows(recs, ledger, all_rec, limit, keep_excluded=False):
         if not keep_excluded and nick_rules.nick_exclude_reason(name):
             stat["昵称排除"] += 1
             continue
-        st = (ledger.get(r.get("uid")) or {}).get("add_status") or ""
+        led = ledger.get(r.get("uid")) or {}
+        st = led.get("add_status") or ""
         f = {
             "达人名称": name,
             "达人抖音号": r.get("douyin_id") or "",
@@ -230,6 +246,10 @@ def build_rows(recs, ledger, all_rec, limit, keep_excluded=False):
             "短视频结算总额": fmt_range(r.get("settle_video")),
             "所属平台": ["抖音"],
         }
+        # 微信号：优先取 darens.json 自己的；没有再回落到 B 阶段台账（防 darens.json 被新批次覆盖）
+        wx = wx_of(r) or wx_of(led)
+        if wx:
+            f["达人微信号"] = wx
         if r.get("fans") is not None:
             try:
                 f["粉丝数"] = int(r["fans"])
@@ -247,7 +267,39 @@ def build_rows(recs, ledger, all_rec, limit, keep_excluded=False):
     return rows, stat
 
 
-def push(bt, tid, rows, existing, dry):
+def wx_map_from_ledger(ledger):
+    """B 阶段台账 -> {达人名称: 微信号}（只收 contact_type=微信 的）。"""
+    m = {}
+    for r in ledger.values():
+        n = (r.get("nickname") or "").strip()
+        wx = wx_of(r)
+        if n and wx:
+            m.setdefault(n, wx)
+    return m
+
+
+def backfill_wx(existing, wxmap):
+    """表内**已存在**但「达人微信号」为空的行 -> 按达人名称补微信号。
+
+    只产出 update（**绝不新增行**）：历史行是 A/B 阶段早期登记的，当时的 darens.json
+    早已被覆盖，但 B 阶段台账 `add_results.json` 里有全部达人的联系方式，所以能回补。
+    ⚠️ 用户手动填过的值一律不动（只在为空时才补）。
+    """
+    ups = []
+    for name, rec in existing.items():
+        wx = wxmap.get(name)
+        if not wx:
+            continue
+        cur = (rec.get("fields") or {}).get("达人微信号")
+        if isinstance(cur, list) and cur and isinstance(cur[0], dict):
+            cur = cur[0].get("text") or cur[0].get("name") or ""
+        if str(cur or "").strip():
+            continue
+        ups.append((rec.get("record_id"), {"达人微信号": wx}))
+    return ups
+
+
+def push(bt, tid, rows, existing, dry, extra_updates=None):
     """按「达人名称」diff 出 create / update 并提交。"""
     creates, updates = [], []
     for f in rows:
@@ -278,6 +330,22 @@ def push(bt, tid, rows, existing, dry):
             delta[k] = v
         if delta:
             updates.append((old.get("record_id"), delta))
+
+    # 回补历史行（表内已有、但「达人微信号」为空）
+    if extra_updates:
+        rid_have = {rid for rid, _ in updates}
+        n = 0
+        for rid, d in extra_updates:
+            if rid in rid_have:
+                # 同一行已有 update，把微信号并进去
+                for i, (r0, d0) in enumerate(updates):
+                    if r0 == rid:
+                        d0.update(d)
+                        break
+            else:
+                updates.append((rid, d))
+            n += 1
+        log("  其中「达人微信号」回补 %d 行（历史行只补这一列）" % n)
 
     log("  待新增 %d 条 / 待更新 %d 条" % (len(creates), len(updates)))
     if dry:
@@ -327,6 +395,8 @@ def main():
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--include-excluded", action="store_true",
                     help="连昵称命中规则7排除词的也登记（一般不用）")
+    ap.add_argument("--no-backfill", action="store_true",
+                    help="不回补历史行的「达人微信号」列")
     a = ap.parse_args()
 
     dpath = os.path.join(OUT, "darens.json")
@@ -366,7 +436,14 @@ def main():
         sys.exit(3)
     log("  表内已有 %d 条记录" % len(existing))
 
-    c, u, n = push(a.base_token, a.table_id, rows, existing, a.dry)
+    extra = []
+    if not a.no_backfill:
+        wxmap = wx_map_from_ledger(ledger)
+        extra = backfill_wx(existing, wxmap)
+        log("  台账里有微信号的达人 %d 个 / 需回补历史行 %d 条"
+            % (len(wxmap), len(extra)))
+
+    c, u, n = push(a.base_token, a.table_id, rows, existing, a.dry, extra)
     log("完成：新增 %d / 更新 %d / 实际成功 %d" % (c, u, n))
 
 
