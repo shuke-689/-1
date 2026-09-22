@@ -51,7 +51,7 @@ export PATH="/c/Users/<你>/.workbuddy/binaries/PortableGit/versions/1.2.0/cmd:\
 | `tools/collect_more.py` | **阶段A 多轮累积采集**：反复跑 `collect.py`，按「台账里没有的微信号」去重攒够 N 个，自动合并回 `darens.json`。见 §2.1 |
 | `tools/salvage_scan.py` | **候选池告急时的回收器**：扫 `out/collect/**/*.json`（含 `archive/`），捞出「有微信 + 不在台账 + 通过当前全部规则」的达人。`--merge` 直接并入名单（不重开浏览器）。见 RUNBOOK §3.2.2 |
 | `tools/merge_into_darens.py` | **把 `OUT_TAG` 跑出来的试跑/补采产物并进正式名单**（自动备份 + 按 uid 去重）。`--from <json> --only-with-contact [--dry]`。⚠️ 别手工拼 json，也别把 `darens_xxx.json` 改名冒充 `darens.json` |
-| `tools/z_recheck.py` | **Z 口径复核器**：用当前规则（Z 类目 + 3a/3b/3c/3d/**3f** + 规则7）重筛 `darens.json`。`--drop` 摘掉不合格项。**规则改动后、跑阶段B 前必做**。见 RUNBOOK §3.2.2 |
+| `tools/recheck.py` | **名单复核器**（原名 `tools/z_recheck.py`，2026-09-22 改名）：用当前规则（规则2b/2c 结算额 + 规则2d 粉丝量 + 规则4 类目 + 3a/3b/3c/3d + 规则7）重筛 `darens.json`。`--drop` 摘掉不合格项。**规则改动后、跑阶段B 前必做**。见 RUNBOOK §3.2.2 |
 | `tools/check_js.py` | 把 .py 里 Playwright 用的 JS 负载抠出来做 `node --check`，见 §7 |
 
 ## 1. 触发词 → 立即动作
@@ -107,42 +107,48 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 
 **标准流程**
 
-1. **后台启动双类目采集**（个护家清 + 美妆，按 uid 去重合并；
-   每批目标有效达人数默认 **各 30**，由 `GHQ_TARGET` / `MZ_TARGET` 控制）：
+1. **后台启动双类目采集**（批①`个护家清 > 个人护理`、批②`美妆 > 不限`，按 uid 去重合并）：
    ```bash
    export MAX_SCROLL=60 MAX_CANDIDATE=300
    export BATCH_COOLDOWN=300 MAX_RETRY=3 LOGIN_WAIT_SEC=1800
+   export TOTAL_TARGET=50        # 两批自动对半：各 25（要加 50 个微信时就用这个）
    "$PY" collect_30.py
    ```
    必须放进**一个** `run_in_background` 任务里跑——Bash 命令结束时其子进程会被回收。
    两批之间**强制冷却 5 分钟**，避免平台限流 11001。
+   > 目标数量：`TOTAL_TARGET=50` → **各 25**（奇数时个护多 1 个）；不设则退回
+   > `GHQ_TARGET` / `MZ_TARGET`（默认各 **30**）。
    > 深度沿革：2026-09-17 用户反馈「有很多时尚的、符合类目的，均未筛选到」，
    > 排查发现候选池 104 个只处理了 22 个就凑满 15 个停了 → 改为**每批 30**
    > （约扫 40-60 个候选，耗时翻倍）。想浅采集：`GHQ_TARGET=15 MZ_TARGET=15`。
    >
-   > 🔴 **2026-09-17 起「平台侧不再筛类目」**（用户原话：「在主推类目中，不对类目进行筛选，
-   > 只在下方查看达人时，选择之前所要求的类目达人」）→ 主推类目留「**全部**」，
-   > 类目改由**本地规则4** 按达人列表里每行显示的类目标签把关（必须含个护家清或美妆）。
-   > 因此**两批的候选基本重合**，去重后 ≈ 一份名单。`PLATFORM_CATE_FILTER=1` 可恢复旧行为。
+   > 🔴 **2026-09-22 用户改回「平台侧筛类目」+ 新增「内容类型」**（原话见 RUNBOOK §1.6）。
+   > 平台侧现在**只筛三项**：主推类目（级联）+ 内容类型（13 项）+ 直播结算总额 1w-10w。
+   > 其余（粉丝量/有联系方式/达人画像/粉丝画像）**全部清除**：
+   > · 粉丝量 → 本地**规则2d** 兜底；达人性别 → 本地 `gender!=2` 兜底；
+   > · ⚠️ **「有联系方式」没有本地兜底** → 清掉后每个候选都要开主页才知道有没有微信，A 明显变慢。
    >
-   > 平台侧**新增两条**（都走 agg 面板三步：**请选择 → 选项 → 确认**，少点「确认」不生效）：
-   > `达人画像 → 达人性别 = 女`（`author_gender:["2"]`）、
-   > `粉丝画像 → 粉丝性别 = 女性居多`（`fans_gender:["2"]`）。
-   > ⚠️ 平台文案是「**女**」不是「女性」；面板里**没有**「女」这个字，别用文本找。
-   > 关掉：`PORTRAIT_OPTION=` / `FANS_GENDER_OPTION=`（设为空或「不限」）
+   > 🔴 **内容类型必须先点 form-item 右侧的「展开」再点 chip**（用户明确要求）。
+   > 收起态 form-item 只 24px 高、后半个 chip 被裁在可视区外，直接按坐标点会点错。
+   > chip 是 `SPAN`、**选中后背景仍是 transparent** → 选没选中只能靠 payload 校验，别用颜色判。
+   >
+   > 退出码约定不变：**0** 正常 / **2** 筛选没生效（三项任一，冷却 45s 重试）/ **3** 登录失效中止。
 
 2. **盯进度**：`out/collect_30.log`、`out/collect_ghq.log`、`out/collect_mz.log`。
    每批取满目标有效达人（成功取到联系方式）自动停。
    看到「当前未登录精选联盟」→ **提醒用户去 Edge 窗口里登录**。
    ⚠️ 筛完必须看到 `[verify] 接口校验通过` 那行；没看到或报错就是筛选没生效。
-   通过时 payload 形如（`main_cate_new` 只在 `PLATFORM_CATE_FILTER=1` 时才出现）：
+   通过时 payload 形如（2026-09-22 起**就这三项**，实测日志）：
    ```
-   [verify] 接口校验通过：{"common_range_selection_live_sales_30d_settle":["2"],
-            "fans_num":["1"], "has_contact":["true"],
-            "author_gender":["2"], "fans_gender":["2"]}
+   [verify] 接口校验通过：{"main_cate_new": ["5"],
+            "common_selection_first_cate_code": ["1000003462"],
+            "content_type": ["亲子","休闲娱乐","剧情","情感","时尚","明星","母婴","生活记录",
+                             "舞蹈","艺术","音乐","颜值","其他"],
+            "common_range_selection_live_sales_30d_settle": ["2"]}
    ```
    （`author_portrait` / `fan_portrait` 上的 `["undefined"]` 是**平台自己加的父级占位键**，
      **无害**，实测列表照常返回数据，别当 bug 去"修"。）
+   ⚠️ 老日志里出现 `fans_num` / `has_contact` / `author_gender` / `fans_gender` 是 09-22 之前的口径。
 
    🔴 **平台侧「直播结算总额」筛选不严格（2026-09-17 实测）**：
    `[verify]` 通过 ≠ 平台真的按区间给数据。实测个护家清批次
@@ -160,7 +166,7 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
    且等级 ≥ `UNAUTH_LEVEL_MIN`（默认 **2**）→ 放行。所以「直播结算总额 1-10w」并非绝对严格；
    要一个都不放过就 `export UNAUTH_LEVEL_MIN=0`。日志会打「规则2c 未授权放行 … 放行 N 个」。
    🔴 **「结算额 1w-10w」在三条支路上都要守**（2026-09-22 补齐）：除主流程 `collect.py` 外，
-   **回收 `tools/salvage_scan.py`（`--merge` 直接写名单）/ 复核 `tools/z_recheck.py`（`--drop`）/
+   **回收 `tools/salvage_scan.py`（`--merge` 直接写名单）/ 复核 `tools/recheck.py`（`--drop`）/
    救急重建 `.probe/build_candidates_from_archive.py`（`--write`）** 也会写出或改写
    `darens.json`，而它们原先**都漏了结算额关卡**（实测归档 331 条里 **50 条越界**会被放进名单）。
    现全部复用 `collect.settle_ok/settle_unreadable/level_ok`，取区间统一用
@@ -177,19 +183,19 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 | 3 | 等满 `LOGIN_WAIT_SEC` 仍没登录 | **中止全流程**；调大 `LOGIN_WAIT_SEC` 或先跑可选辅助 `login.py` |
 
 **筛选条件与业务规则**：全部见 `RUNBOOK.md` 第 2 节（含 7 条规则、接口字段对照、
-结算类字段表、内容类型 40 项、昵称排除三层词表）。
+结算类字段表、内容类型平台选项 40 项（现行只勾 13 项）、昵称排除三层词表）。
 
-**⭐ 两套筛选口径（2026-09-19 新增）**：`FILTER_PROFILE=Z`（**现为默认**，
-用户 2026-09-19 定调「默认按分支 Z，不用再问」）/ `FILTER_PROFILE=A`（历史规则，仅回溯用）。
-- Z = 主词条 个护家清·美妆 + 副词条随意；单主词条时内容类型须命中
-  `时尚/情感/剧情/颜值/音乐/舞蹈/亲子`
-- Z 追加**规则3f**：达人主页带货分析里，**单一店铺占所带商品 ≥50%（且件数严格过半）→ 跳过**
-  （函数 `collect.py::shopshare_verdict()`，阈值 `SHOP_SHARE_RATIO`，仅 Z 下生效）
-- 判定函数 `collect.py::z_verdict()`（纯函数，返回 `z_nocate` / `z_single`）
-- `tools/collect_more.py` 会**透传**该变量，驱动日志打印「筛选口径：分支 Z」
-- 完整口径 + 页面标签速查表见 `RUNBOOK.md` §1.6；自查脚本 `tools/_z_check.py`、
-  `tools/_rule3f_test.py`
-- ⚠️ Z 放宽后单轮候选会暴涨（实测 1216 达人 → 600 候选），耗时显著变长
+**⭐ 现行筛选口径（2026-09-22 用户改定，**只有一套**）** —— 完整口径见 `RUNBOOK.md` §1.6。
+- **平台侧只筛三项**：① 主推类目级联（批①`个护家清 > 个人护理`、批②`美妆 > 不限`）
+  ② **内容类型 13 项**（`亲子/休闲娱乐/剧情/情感/时尚/明星/母婴/生活记录/舞蹈/艺术/音乐/颜值/其他`，
+  先点「展开」再点 chip） ③ 直播结算总额 `1w-10w`。
+- 加载页时**同时**用 payload 校验这三项，缺一项就 `exit 2`（不产脏数据）。
+- **本地规则4 简化**：`main_cate` 必须命中 `个护家清` / `美妆` **其一**（函数 `collect.py::cate_verdict()`）。
+- 🔴 **已删除**（2026-09-22）：`FILTER_PROFILE` / `Z_MAIN` / `Z_SUB` / `Z_SINGLE_CONTENT` /
+  `Z_CONTENT_BLACKLIST` / `z_verdict()` / **规则3f**（`shopshare_verdict` / `SHOP_SHARE_RATIO` / `top_shop*`）。
+  历史实现见 git 历史；别再去找这些名字。
+- 平台侧移除的四项（粉丝量/有联系方式/达人画像/粉丝画像）里，**只有「有联系方式」没有本地兜底**
+  → A 阶段会明显变慢（每个候选都要开主页才知道有没有微信）。
 
 改规则时改 `collect.py` 顶部的常量区（`CATE_*` / `SALE_*` / `*_EXCLUDE_*` /
 `SAME_BRAND_RATIO` / `TARGET_DAREN` / `MIN_SHOP_CNT` / `CHEAP_PRICE` / `CHEAP_RATIO`），
@@ -528,7 +534,7 @@ B 拍到 Edge → 误判 `risk_control` 整轮中止 / `not_found` 永久跳过�
 | 想复现/回归弹窗定位逻辑 | `"$PY" tools/check_js.py douyin_id.py` + `"$NODE" out/_jscheck/test_find_close.js`（桩 DOM，9 场景，无需浏览器/不占 profile） |
 | `status` 报的待加数比实际加的多 | 已修：`status` 现在也过规则7 过滤器；若仍不一致，检查是否用了旧版脚本 |
 | **飞书表里「结算总额 / 直播结算总额」= `0-0`** | **平台侧筛选不严格**（`[verify]` 通过但 156 条漏出 16 条）。`0-0` 是真实源数据（取不到值会显示**空串**而不是 0-0）。已加**规则2b** 本地兜底；回查历史遗留跑 `"$PY" feishu_audit.py` |
-| 名单里混进粉丝 >10w 的大号 | **规则2d 本地粉丝量兜底**（`fans_ok()`，默认开，上限 `FANS_MAX=100000`）。起因：平台把「粉丝量」改名「粉丝指数」，且本地原先**没有**粉丝量这一关（`bad_fans()` 只是抽样计数）。日志看「规则2d 粉丝量兜底」+「粉丝量被剔除样本」 |
+| 名单里混进粉丝 >10w 的大号 | **规则2d 本地粉丝量兜底**（`fans_ok()`，默认开，上限 `FANS_MAX=100000`）。起因：① 平台把「粉丝量」改名「粉丝指数」；② **2026-09-22 起平台侧该项被整体移除**，本地成了唯一防线（`bad_fans()` 只是抽样计数、不拦数据）。日志看「规则2d 粉丝量兜底」+「粉丝量被剔除样本」 |
 | 日志「去重后 N 个达人」后紧跟「直播结算总额不在1w-10w M 个」 | 这行是**平台漏出的计数**（`bad_settle()` 只统计不拦数据），后面还会有「本地过滤：… 结算额不合格 K」才是真正被拦掉的。两个数不等是正常的 |
 
 诊断探针（`.probe/`）：`probe_login.py`、`probe_api.py <类目>`、
@@ -536,7 +542,9 @@ B 拍到 Edge → 误判 `risk_control` 整轮中止 / `not_found` 永久跳过�
 `probe_filters.py <类目>`、`probe_douyin_id.py` / `probe_douyin_id2.py`（取抖音号，含串号证据）、
 `probe_square.py`（dump 达人广场页面结构，确认某控件**存不存在**）、
 `probe_portrait.py`（dump agg 面板真实 DOM）、
-`probe_agg.py`（用 `ast` 抠出 collect.py 的**真实** JS 常量跑 agg 三步，再核对 payload）。
+`probe_agg.py`（用 `ast` 抠出 collect.py 的**真实** JS 常量跑 agg 三步，再核对 payload）、
+`probe_ct_cate.py`（摸「内容类型」42 个 chip / 「展开」按钮 / 「主推类目>个人护理」级联；
+产出 `.probe/out_ct_cate.log`，**别用 `tail` 看**会被截断）。
 
 ## 7. 单测
 

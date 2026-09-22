@@ -107,15 +107,15 @@ def run_pass(idx, target_daren):
     env = os.environ.copy()
     env.update({
         "CATE_PARENT": os.environ.get("CATE_PARENT", "个护家清"),
-        "CATE_CHILD": os.environ.get("CATE_CHILD", "不限"),
+        "CATE_CHILD": os.environ.get("CATE_CHILD", "个人护理"),
         "TARGET_DAREN": str(target_daren),
         "OUT_TAG": tag,
         "MAX_SCROLL": os.environ.get("MAX_SCROLL", "150"),
         "MAX_CANDIDATE": os.environ.get("MAX_CANDIDATE", "600"),
         "DAREN_PAUSE": os.environ.get("DAREN_PAUSE", "1.5"),
         "LOGIN_WAIT_SEC": os.environ.get("LOGIN_WAIT_SEC", "600"),
-        # 筛选口径透传（Z = 现行默认口径，2026-09-19 用户定；A = 仅回溯/对比用）
-        "FILTER_PROFILE": os.environ.get("FILTER_PROFILE", "Z"),
+        # 筛选口径透传（2026-09-22：平台侧固定 主推类目级联 + 内容类型 + 结算额；
+        # 分支 Z / FILTER_PROFILE 已整体删除）
         "UNAUTH_LEVEL_MIN": os.environ.get("UNAUTH_LEVEL_MIN", "2"),
     })
     jp = os.path.join(OUT, "darens%s.json" % tag)
@@ -154,7 +154,10 @@ def main():
         % (len(base_recs), len(base_uids), len(have)))
     log("目标：攒够 %d 个新的有微信联系方式的达人（最多 %d 轮，每轮 TARGET_DAREN=%d）"
         % (args.target, args.rounds, args.target_daren))
-    log("筛选口径：分支 %s" % os.environ.get("FILTER_PROFILE", "Z"))
+    log("筛选口径：平台侧 = 主推类目(%s>%s) + 内容类型 + %s"
+        % (os.environ.get("CATE_PARENT", "个护家清"),
+           os.environ.get("CATE_CHILD", "个人护理"),
+           os.environ.get("SALE_LABEL", "直播结算总额")))
     log("=" * 70)
     if args.dry:
         return

@@ -1,26 +1,30 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Z 口径复核器 —— 用**当前代码里的规则**重新检查 `out/collect/darens.json`。
+"""名单复核器 —— 用**当前代码里的规则**重新检查 `out/collect/darens.json`。
 
 用途（为什么需要它）：
-  - 名单是历史多轮累积的，规则却一直在长（如 2026-09-19 新增规则3f 单一店铺占比）。
+  - 名单是历史多轮累积的，规则却一直在长（如 2026-09-22 简化了规则4、下架了分支Z）。
   - 某一轮采集可能是在**新规则写进代码之前**启动的 -> 它产出的名单没经过新规则。
   - 阶段B 只认 darens.json，不重筛 -> 必须在这里补一道闸，避免把不该加的达人加出去。
 
 复核项（全部在本地用记录里已存的字段重算，不再打开浏览器）：
-  · 规则2b 结算额兜底 settle_ok(live_low, live_high)           -> 不在 SALE_OPTION 区间内即不合格
+  · 规则2b 结算额兜底 settle_ok(live_low, live_high)   -> 不在 SALE_OPTION 区间内即不合格
     （规则2c 未授权放行：结算额读不到但等级 >= UNAUTH_LEVEL_MIN 的，与 collect.py 一致地放行）
-  · Z 类目口径      z_verdict(main_cate, content_type)         -> z_nocate / z_single
-  · 规则3b 禁忌商品  product_exclude_hit(titles)
-  · 规则3c 店铺家数  shopcnt_verdict(shops)
-  · 规则3d 低价铺货  price_cheap_ratio >= CHEAP_RATIO（且 price_n/price_rows >= PRICE_MIN_PARSE）
-  · 规则3f 单店铺占比 shopshare_verdict(shops)                  （分支 Z 专属）
-  · 规则3a 同品牌    brand_verdict(shops)
-  · 规则7  昵称排除  nick_rules.nick_exclude_reason(nickname)
+  · 规则2d 粉丝量兜底 fans_ok(fans)                    -> 超 FANS_MAX（或取不到）不合格
+  · 规则4  主推类目   cate_verdict(main_cate)          -> 没命中 个护家清/美妆 其一即 nocate
+  · 规则3b 禁忌商品   product_exclude_hit(titles)
+  · 规则3c 店铺家数   shopcnt_verdict(shops)
+  · 规则3d 低价铺货   price_cheap_ratio >= CHEAP_RATIO（且 price_n/price_rows >= PRICE_MIN_PARSE）
+  · 规则3a 同品牌     brand_verdict(shops)
+  · 规则7  昵称排除   nick_rules.nick_exclude_reason(nickname)
+
+⚠️ 2026-09-22 变更：原名 `tools/z_recheck.py`（Z 口径复核器）。分支Z 删除后，
+   其中的 `z_verdict` 与规则3f（`shopshare_verdict`）复核项**一并移除**，
+   类目项改为与采集同源的 `cate_verdict`。报告文件名改为 `out/recheck_report.txt`。
 
 用法：
-  python tools/z_recheck.py             # 只出报告 out/z_recheck_report.txt，不改名单
-  python tools/z_recheck.py --drop      # 额外：把不合格的达人从 darens.json 摘掉（自动备份）
+  python tools/recheck.py            # 只出报告，不改名单
+  python tools/recheck.py --drop     # 额外：把不合格的达人从 darens.json 摘掉（自动备份）
 
 ⚠️ 只对「有微信联系方式」的记录做裁决（没有联系方式的本来也加不了），
    但报告里会列出全部不合格项，便于人工复核。
@@ -37,7 +41,7 @@ sys.path.insert(0, BASE)
 OUT = os.path.join(BASE, "out")
 COLLECT = os.path.join(OUT, "collect")
 DARENS = os.path.join(COLLECT, "darens.json")
-REPORT = os.path.join(OUT, "z_recheck_report.txt")
+REPORT = os.path.join(OUT, "recheck_report.txt")
 
 
 def main():
@@ -57,9 +61,10 @@ def main():
 
     P("复核文件 = %s" % a.file)
     P("记录数 = %d" % len(recs))
-    P("口径：FILTER_PROFILE=%s / %s=%s-%s / UNAUTH_LEVEL_MIN=%d / SHOP_SHARE_RATIO=%.0f%% / CHEAP_RATIO=%.0f%% / MIN_SHOP_CNT=%d"
-      % (C.FILTER_PROFILE, C.SALE_LABEL, C.SETTLE_MIN, C.SETTLE_MAX, C.UNAUTH_LEVEL_MIN,
-         C.SHOP_SHARE_RATIO * 100, C.CHEAP_RATIO * 100, C.MIN_SHOP_CNT))
+    P("口径：%s=%s-%s / UNAUTH_LEVEL_MIN=%d / FANS_MAX=%d / CHEAP_RATIO=%.0f%%"
+      " / MIN_SHOP_CNT=%d / 规则4=命中%s其一"
+      % (C.SALE_LABEL, C.SETTLE_MIN, C.SETTLE_MAX, C.UNAUTH_LEVEL_MIN, C.FANS_MAX,
+         C.CHEAP_RATIO * 100, C.MIN_SHOP_CNT, "/".join(C.CATE_MUST_ANY)))
     P("")
 
     bad, keep = [], []
@@ -77,17 +82,17 @@ def main():
                     unauth_pass = True          # 规则2c
                 else:
                     why.append("2b结算额%s" % note)
-        okz, _h, whyz = C.z_verdict(r.get("main_cate"), r.get("content_type"))
-        if not okz:
-            why.append("Z类目:%s" % whyz)
-        # 规则2d 粉丝量兜底（2026-09-22 补：复核闸原先不查粉丝量，
-        #   而平台侧「粉丝量」筛选项已改名「粉丝指数」，漏一次就会放进大号）
+        # 规则4 主推类目（2026-09-22 简化：只要命中 个护家清/美妆 其一）
+        okc, _hits, whyc = C.cate_verdict(r.get("main_cate") or [])
+        if not okc:
+            why.append("规则4类目:%s" % whyc)
+        # 规则2d 粉丝量兜底
         if C.LOCAL_FANS_FILTER:
             _fok, _fnote = C.fans_ok(r.get("fans"))
             if not _fok:
                 why.append("2d粉丝%s" % _fnote)
         if unauth_pass:
-            # 规则2c 命中：带货分析（3a/3b/3c/3d/3f）在采集时已因「未授权」被免掉，
+            # 规则2c 命中：带货分析（3a/3b/3c/3d）在采集时已因「未授权」被免掉，
             # 名单里这几个字段本就是空的 -> 不再拿它们判不合格，否则会误杀。
             nk = NR.nick_exclude_reason(r.get("nickname") or "")
             if nk:
@@ -117,11 +122,6 @@ def main():
                 why.append("3d低价%.0f%%" % (ratio_d * 100))
         elif n_all:
             why.append("3d样本不足(%s/%s)" % (n_ok, n_all))
-        # 3f 单店铺占比（分支 Z）
-        if C.FILTER_PROFILE == "Z":
-            f, fr, fn, ft, fc = C.shopshare_verdict(shops)
-            if f:
-                why.append("3f单店铺%.0f%%:%s" % (fr * 100, fn))
         # 3a 同品牌
         bs, br, bn, bt, bc = C.brand_verdict(shops)
         if bs:
@@ -143,7 +143,7 @@ def main():
 
     if a.drop and bad:
         bad_uids = {b["uid"] for b in bad if b["uid"]}
-        bak = os.path.join(COLLECT, "darens.bak_before_zrecheck_%s.json"
+        bak = os.path.join(COLLECT, "darens.bak_before_recheck_%s.json"
                            % time.strftime("%H%M%S"))
         shutil.copy2(a.file, bak)
         new = [r for r in recs if r.get("uid") not in bad_uids]

@@ -10,15 +10,18 @@
 
 做法：
   1. 扫 `out/collect/**/*.json`（排除 apis*/probe*）；
-  2. 用**当前代码里的规则**复核：规则2b/2c 结算额 + Z 类目口径 + 规则3b/3c/3d/3f/3a + 规则7 昵称；
+  2. 用**当前代码里的规则**复核：规则2b/2c 结算额 + 规则2d 粉丝量 + 规则4 类目
+     + 规则3b/3c/3d/3a + 规则7 昵称；
   3. 与台账 `out/wechat/add_results.json` 的微信号去重、按 uid 去重；
   4. 输出 `out/salvage_ready.json`（可直接并入名单的那批），并打印明细。
 
 用法：
   python tools/salvage_scan.py                 # 只扫描出报告
   python tools/salvage_scan.py --merge         # 额外并入 darens.json（自动备份，按 uid 去重）
-  python tools/salvage_scan.py --no-z          # 不套 Z 口径（只按昵称+台账去重）
+  python tools/salvage_scan.py --no-cate       # 不套规则4 类目口径（只按昵称+台账去重）
 
+⚠️ 2026-09-22：分支Z 删除后，`z_verdict` 与规则3f 复核项**一并移除**，
+   类目项改为与采集同源的 `cate_verdict`；旧参数 `--no-z` 仍可用（等价 `--no-cate`）。
 ⚠️ 并入 darens.json 前务必确认 `tools/collect_more.py` 没有正在跑：
    驱动在**结束时**会用「启动时的 base + 本轮新增」整体重写 darens.json，
    会把这里并入的记录冲掉（已加入台账的不受影响，但名单会缺这几条）。
@@ -44,7 +47,8 @@ REPORT = os.path.join(OUT, "salvage_scan_report.txt")
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--merge", action="store_true", help="把合格候选并入 darens.json")
-    ap.add_argument("--no-z", action="store_true", help="不套 Z 类目口径")
+    ap.add_argument("--no-cate", "--no-z", dest="no_cate", action="store_true",
+                    help="不套本地类目口径（规则4）")
     a = ap.parse_args()
 
     import collect as C          # noqa: E402
@@ -100,17 +104,17 @@ def main():
                         unauth_pass = True    # 规则2c
                     else:
                         why.append("2b结算额%s" % note)
-            if not a.no_z:
-                okz, _h, whyz = C.z_verdict(r.get("main_cate"), r.get("content_type"))
-                if not okz:
-                    why.append("Z类目:" + str(whyz))
+            if not a.no_cate:
+                okc, _h, whyc = C.cate_verdict(r.get("main_cate") or [])
+                if not okc:
+                    why.append("规则4类目:" + str(whyc))
             # 规则2d 粉丝量兜底（2026-09-22 补：回收原先不查粉丝量，
             #   而 `--merge` 会直接把合格项写进 darens.json）
             if C.LOCAL_FANS_FILTER:
                 _fok, _fnote = C.fans_ok(r.get("fans"))
                 if not _fok:
                     why.append("2d粉丝%s" % _fnote)
-            # 规则2c 放行的达人「带货分析」本来就读不到 -> 下列 3a/3b/3c/3d/3f 的样本
+            # 规则2c 放行的达人「带货分析」本来就读不到 -> 下列 3a/3b/3c/3d 的样本
             # 字段是空的，各判定函数对空样本都返回「不判定」，不会误杀，故无需额外跳过。
             hit = C.product_exclude_hit(r.get("titles"))
             if hit:
@@ -130,10 +134,6 @@ def main():
                     why.append("3d低价%.0f%%" % (ratio_d * 100))
             elif n_all:
                 why.append("3d样本不足(%s/%s)" % (n_ok, n_all))
-            if not a.no_z:
-                f3f, fr, fn, _ft, _fc = C.shopshare_verdict(shops)
-                if f3f:
-                    why.append("3f单店铺%.0f%%:%s" % (fr * 100, fn))
             bs, br, bn, _bt, _bc = C.brand_verdict(shops)
             if bs:
                 why.append("3a同品牌%.0f%%:%s" % (br * 100, bn))

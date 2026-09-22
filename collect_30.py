@@ -1,18 +1,27 @@
 # -*- coding: utf-8 -*-
-"""双类目采集驱动：每批采集「个护家清」+「美妆」两个类目的达人，合并成一份名单。
+"""双类目采集驱动：每批采集一个「主推类目」组合的达人，合并成一份名单。
 
 为什么分两批：
-  精选联盟的「主推类目」筛选是级联选择，一次只能选一个大类；
+  精选联盟的「主推类目」筛选是**级联选择**，一次只能选一个大类的一个子项；
   按类目分批跑 collect.py（每批独立设 TARGET_DAREN），最后按 uid 去重合并。
+
+🔴 2026-09-22 用户改口径（原话）：
+  「个护家清选择个人护理，美妆则选择不限，筛选时分两次，
+    如我需要添加50个微信时，则个护部分筛选25个，美妆部分筛选25个。」
+  -> 两批的 (父类目, 子类目) 固定为：
+       批① 个护家清 > 个人护理   （tag=ghq）
+       批② 美妆     > 不限       （tag=mz）
+  -> 目标数量支持「给总数自动对半」：`TOTAL_TARGET=50` -> 各 25（奇数时个护多 1 个）。
+     不设 TOTAL_TARGET 时退回 GHQ_TARGET/MZ_TARGET（默认各 30）。
 
 采集深度（用户 2026-09-17 改「看更深一些」）：
   之前每批只取 15 个有效达人就停，候选池里靠后的大量达人**根本没被检查**，
   用户反映「有很多时尚的、符合类目的，未筛选到」。
-  现改为每批 **GHQ_TARGET/MZ_TARGET（默认 30）**，即大约要看 40-60 个候选达人，
-  耗时和平台请求都接近翻倍。想回到原来的浅采集：`GHQ_TARGET=15 MZ_TARGET=15`。
+  现默认每批 30 个有效达人，即大约要看 40-60 个候选达人。
+  想回到浅采集：`GHQ_TARGET=15 MZ_TARGET=15`。
 
 限流（重要）：
-  抖音精进联盟的 square_pc_api 请求过密会返回
+  抖音精选联盟的 square_pc_api 请求过密会返回
       {"code":11001,"msg":"请求过于频繁，请稍后再试"}
   此时列表会渲染成「未找到相关达人」，看起来像"该类目没数据"，其实是**被限流**。
   踩过：个护家清批次跑完后紧接着跑美妆批次，美妆直接拿 0 个。
@@ -22,12 +31,14 @@
 
 用法：
   python collect_30.py
+  TOTAL_TARGET=50 python collect_30.py          # 两批各 25 个（目标凑 50 个微信）
 环境变量：
-  GHQ_TARGET  个护家清目标有效达人数（默认 30）
-  MZ_TARGET   美妆目标有效达人数（默认 30）
+  TOTAL_TARGET    两批合计目标有效达人数（给了就自动对半，优先于下面两个）
+  GHQ_TARGET      个护家清目标有效达人数（默认 30）
+  MZ_TARGET       美妆目标有效达人数（默认 30）
   BATCH_COOLDOWN  批次间冷却秒数（默认 300）
   MAX_RETRY       单批限流重试次数（默认 3）
-  MAX_SCROLL / MAX_CANDIDATE / SAME_BRAND_RATIO / DAREN_PAUSE 透传给 collect.py
+  MAX_SCROLL / MAX_CANDIDATE / SAME_BRAND_RATIO / DAREN_PAUSE / CONTENT_TYPES 透传给 collect.py
 
 登录（用户 2026-09-16 定：跳过自动登录）：
   本驱动**不会**去跑 login.py。collect.py 发现未登录时会停在原地，打印提示，
@@ -49,9 +60,31 @@ OUT = os.path.join(BASE, "out", "collect")
 LOG = os.path.join(BASE, "out", "collect_30.log")
 os.makedirs(OUT, exist_ok=True)
 
+
+def _split_targets():
+    """算两批各自的目标有效达人数。返回 (个护家清, 美妆)。
+
+    优先 TOTAL_TARGET（自动对半，奇数时个护家清多 1 个），否则用 GHQ_TARGET/MZ_TARGET。
+    """
+    total = (os.environ.get("TOTAL_TARGET") or "").strip()
+    if total:
+        try:
+            n = max(0, int(total))
+        except ValueError:
+            n = 0
+        if n:
+            a = (n + 1) // 2                 # 奇数时个护多分 1 个
+            return a, n - a
+    return (int(os.environ.get("GHQ_TARGET", "30")),
+            int(os.environ.get("MZ_TARGET", "30")))
+
+
+_GHQ_T, _MZ_T = _split_targets()
+
+# (父类目, 子类目, tag, 目标有效达人数)
 JOBS = [
-    ("个护家清", "ghq", int(os.environ.get("GHQ_TARGET", "30"))),
-    ("美妆", "mz", int(os.environ.get("MZ_TARGET", "30"))),
+    ("个护家清", "个人护理", "ghq", _GHQ_T),
+    ("美妆", "不限", "mz", _MZ_T),
 ]
 BATCH_COOLDOWN = int(os.environ.get("BATCH_COOLDOWN", "300"))
 MAX_RETRY = int(os.environ.get("MAX_RETRY", "3"))
@@ -70,12 +103,12 @@ def marker(tag):
     return os.path.join(OUT, "ratelimit_%s.txt" % tag)
 
 
-def run_once(parent, tag, target):
+def run_once(parent, child, tag, target):
     """跑一次 collect.py，返回 (退出码, 是否被限流, 耗时)。"""
     env = os.environ.copy()
     env.update({
         "CATE_PARENT": parent,
-        "CATE_CHILD": os.environ.get("CATE_CHILD", "不限"),
+        "CATE_CHILD": child,
         "TARGET_DAREN": str(target),
         "OUT_TAG": "_" + tag,
     })
@@ -101,14 +134,15 @@ def run_once(parent, tag, target):
     return rc, limited, dt
 
 
-def run_batch(parent, tag, target):
+def run_batch(parent, child, tag, target):
     """跑一批（带限流冷却重试），返回该批 records。"""
     log("=" * 70)
-    log(">>> 第 %s 批：类目=%s / 目标=%d 个有效达人" % (tag, parent, target))
+    log(">>> 第 %s 批：主推类目=%s > %s / 目标=%d 个有效达人"
+        % (tag, parent, child, target))
     log("=" * 70)
     rc, dt = 0, 0.0
     for attempt in range(1, MAX_RETRY + 2):
-        rc, limited, dt = run_once(parent, tag, target)
+        rc, limited, dt = run_once(parent, child, tag, target)
         if rc == 3:
             # 登录态一直没登上（collect.py 已按 LOGIN_WAIT_SEC 等待使用者手动登录）
             log("<<< %s 批中止：一直没检测到精选联盟登录" % parent)
@@ -125,9 +159,10 @@ def run_batch(parent, tag, target):
             continue
         if limited:
             log("<<< %s 批重试 %d 次仍被限流，放弃该批" % (parent, MAX_RETRY))
-        # 退出码 2 = 类目按钮没点到（页面布局/渲染抖动）-> 短冷却重试
+        # 退出码 2 = 筛选没生效（类目/内容类型/结算额任一，页面布局或渲染抖动）
+        #   -> 短冷却重试
         if rc == 2 and attempt <= MAX_RETRY:
-            log("<<< %s 批：类目筛选未生效（退出码 2）-> 冷却 %d 秒后重试（第 %d/%d 次）" % (
+            log("<<< %s 批：筛选未生效（退出码 2）-> 冷却 %d 秒后重试（第 %d/%d 次）" % (
                 parent, CATE_RETRY_WAIT, attempt, MAX_RETRY))
             time.sleep(CATE_RETRY_WAIT)
             continue
@@ -147,14 +182,14 @@ def run_batch(parent, tag, target):
 def main():
     open(LOG, "w", encoding="utf-8").close()
     log("开始双类目采集：%s（批次冷却 %d 秒）" % (
-        " + ".join("%s×%d" % (p, t) for p, _, t in JOBS), BATCH_COOLDOWN))
+        " + ".join("%s>%s×%d" % (p, c, t) for p, c, _, t in JOBS), BATCH_COOLDOWN))
 
     all_recs = []
-    for idx, (parent, tag, target) in enumerate(JOBS):
+    for idx, (parent, child, tag, target) in enumerate(JOBS):
         if idx:
             log("冷却 %d 秒，等平台限流窗口过去…" % BATCH_COOLDOWN)
             time.sleep(BATCH_COOLDOWN)
-        all_recs.extend(run_batch(parent, tag, target))
+        all_recs.extend(run_batch(parent, child, tag, target))
         if NEED_LOGIN["v"]:
             log("!! 一直没检测到精选联盟登录 -> 中止整个采集流程")
             log("!! collect.py 已在你打开的 Edge 窗口里等待；若超时了，可加大等待时间：")

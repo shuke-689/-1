@@ -18,6 +18,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
+# 探针运行时产物（dump/日志，随时可重跑；探针脚本本身照常提交）
+.probe/out_*.log
+.probe/out_*.txt
+.probe/*_out.log
+.probe/*_out.txt
+
 # 本机个人工作记忆（规则知识已沉淀到 RUNBOOK.md，这里不共享）
 .workbuddy/memory/
 

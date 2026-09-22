@@ -219,9 +219,9 @@ SETTLE_MIN, SETTLE_MAX = _settle_bounds()
 
 # ---- 规则2d：本地兜底过滤「粉丝量」（2026-09-22 新增，默认开）----------------
 # 为什么需要它：
-#   ① 平台侧「粉丝量」这个筛选项在 2026-09-22 被改名为「粉丝指数」（见 FANS_LABELS）；
-#      改名期间本地过滤里**完全没有**粉丝量这一关（`bad_fans()` 只是抽样统计、不拦数据），
-#      平台侧一旦没生效/没点到，就会把大号收进来。
+#   ① 2026-09-22 平台侧「粉丝量」被改名为「粉丝指数」，随后按新口径**整体移除**平台侧筛选；
+#      本地过滤里原本**完全没有**粉丝量这一关（`bad_fans()` 只是抽样统计、不拦数据），
+#      没有规则2d 就会把大号收进来。
 #   ② 与规则2b 同源的经验：**平台侧筛选不严格**（结算额实测漏出 ~10%），
 #      粉丝量同样不能只靠平台。
 # 口径：`fans > FANS_MAX` 剔除；**取不到数值 = 未判定 = 剔除**（沿用项目铁律）。
@@ -319,79 +319,69 @@ SALE_FIELD_BY_LABEL = {
     "图文结算总额": "common_range_selection_picture_sales_30d_settle",
     "橱窗结算总额": "common_range_selection_window_sales_30d_settle",
 }
-# 【筛选】粉丝量 = 10w以下
-# 🔴 2026-09-22 平台改版：**「粉丝量」这个筛选项被改名为「粉丝指数」**（选项一字未变）。
-#    实测证据（.probe/probe_fans_seq.py，out/probe_fans_seq_out.txt）：
-#      FIND_FORMITEM_JS("粉丝量")   -> None（不存在）
-#      FIND_FORMITEM_JS("粉丝指数") -> {x:752, y:399, w:100, h:25}
-#      「粉丝指数」下拉选项 = 10w以下 / 10w-100w / 100w-300w / 300w-500w / 500w-1000w / 1000w以上
-#    这 6 档与原「粉丝量」完全一致（注意与结算额那套 1w以下/1w-10w/… 不同），
-#    所以只是**改名**，语义仍是粉丝数档位。
-#    改成候选列表：按顺序取第一个**页面上真实存在**的标签用，平台若改回旧名也照样能跑。
-#    覆盖：export FANS_LABELS="粉丝指数,粉丝量"
-FANS_LABELS = tuple(x.strip() for x in os.environ.get(
-    "FANS_LABELS", "粉丝指数,粉丝量").split(",") if x.strip())
-FANS_LABEL = FANS_LABELS[0]          # 兼容旧引用（日志/文档里仍按这个显示）
-FANS_OPTION = "10w以下"
-FANS_FIELD = "fans_num"
-CONTACT_FIELD = "has_contact"
+# ===========================================================================
+# 【平台侧筛选】2026-09-22 用户改口径：**只保留三项**
+#   ① 主推类目   —— 级联：个护家清 > 个人护理 ／ 美妆 > 不限
+#   ② 内容类型   —— 先在 form-item 右侧点「展开」，再点选 13 个 chip
+#   ③ 直播结算总额 = 1w-10w
+#   （原话：「A阶段平台侧筛选全部清除，按照图中两种进行筛选……」）
+#
+# 🔴 以下平台筛选项已**整体移除**（原代码保留在 git 历史里）：
+#   · 「粉丝量」/「粉丝指数」10w以下  -> 本地**规则2d** 兜底（FANS_MAX，取不到=剔除）
+#   · 「达人画像 > 达人性别 = 女」     -> 本地 `gender != 2` 本来就剔（规则在过滤循环里）
+#   · 「粉丝画像 > 粉丝性别 = 女性居多」-> **无本地兜底**，清掉后不再限制
+#   · 「有联系方式」                  -> 🔴 **无本地兜底**：只有平台侧能给这个字段。
+#        清掉它 A 会明显变慢 —— 每个候选都要开一次主页才知道有没有联系方式。
+#        要恢复：export PLATFORM_EXTRA_FILTER=1（见文件末「恢复旧平台筛选」注释块）
+FANS_FIELD = "fans_num"              # 仅用于文档/排错对照，平台侧不再筛
+CONTACT_FIELD = "has_contact"        # 同上
 CATE_FIELD = "main_cate_new"
+# 子类目落在另一个字段上（2026-09-22 探针实测）：
+#   选「个护家清 > 个人护理」-> payload 同时带
+#     main_cate_new: ["5"] 与 common_selection_first_cate_code: ["1000003462"]
+#   只选父类目「不限」时，只有 main_cate_new。
+CATE_CHILD_FIELD = "common_selection_first_cate_code"
 # 类目名 -> 接口 id（实测自 payload，仅用于校验；选类目本身仍走 UI 级联）
 CATE_ID_BY_NAME = {"个护家清": "5", "美妆": "9"}
 
-# 【筛选】达人画像 -> 达人性别=女 ； 粉丝画像 -> 粉丝性别=女性居多
-#    （用户 2026-09-17 追加，第二批）
-# ------------------------------------------------------------------
-# 平台结构（实测自 out/stage5/filter.json 的 GET /square_pc_api/square/filter，
-#          + 2026-09-17 探针 .probe/probe_portrait.py 实测 DOM）：
-#   达人信息
-#     ├ 达人画像      author_portrait   (type=agg，点开是 .quick-filter-button-agg-pop 面板)
-#     │   ├ 达人性别  author_gender     (type=ratio)  选项: 不限 / 男=1 / 女=2
-#     │   ├ 达人地区  author_location   (type=cascade)
-#     │   └ 签约机构  bind_institution  (type=ratio)
-#     ├ 粉丝画像      fan_portrait
-#     │   └ 粉丝性别  fans_gender       (选项: 不限 / 男性居多=1 / 女性居多=2)
-#     └ 粉丝偏好      fans_profile
-# 🔴 交互**不是**「点开面板就能看到 女」：面板里是若干「标签 + 请选择▾」的行，
-#    必须走三步：① 点该行的 .auxo-select-selection-placeholder（文本「请选择」）
-#                ② 在弹出的 .auxo-select-dropdown 里点选项
-#                ③ 点面板里的「确认」（.quick-filter-button-agg-btns 里的 span）
-#    第一版直接找文本「女」→ 实测失败（面板 radios=[]，text='达人性别 请选择 …'）。
-# ⚠️ 平台文案：达人是「女」（**不是**「女性」）；粉丝是「女性居多」。
-# 为什么要加：本地规则本来就有 `gender == 2`，但那是**采完之后**才过滤 ——
-#   实测 2026-09-17 ghq 批 109 个里 **41 个（38%）是男性**，白占候选池名额。
-# 关掉：把对应 OPTION 设成 "" 或 不限
-PORTRAIT_LABEL = os.environ.get("PORTRAIT_LABEL", "达人画像")
-PORTRAIT_SUB = os.environ.get("PORTRAIT_SUB", "达人性别")
-PORTRAIT_OPTION = os.environ.get("PORTRAIT_OPTION", "女")
-PORTRAIT_FIELD = "author_gender"
-PORTRAIT_VALUE = "2"                     # 女 = 2（男 = 1）
+# 【内容类型】2026-09-22 新增（平台侧）
+#   field_name = content_type，**value 直接是中文名**（探针实测：
+#   点「亲子」「时尚」后 payload = {"content_type": ["亲子", "时尚"]}）。
+#   13 项 = 用户截图所勾选的那一套。
+#   UI 交互：内容类型 form-item 默认**收起**，只露一部分 chip；必须先点右侧「展开」，
+#   展开后才能点到最后那几项（见 apply_content_types()）。
+CONTENT_TYPE_LABEL = os.environ.get("CONTENT_TYPE_LABEL", "内容类型")
+CONTENT_TYPE_FIELD = "content_type"
+CONTENT_TYPES = tuple(x.strip() for x in os.environ.get(
+    "CONTENT_TYPES",
+    "亲子,休闲娱乐,剧情,情感,时尚,明星,母婴,生活记录,舞蹈,艺术,音乐,颜值,其他",
+).split(",") if x.strip())
 
-FANS_PROFILE_LABEL = os.environ.get("FANS_PROFILE_LABEL", "粉丝画像")
-FANS_GENDER_SUB = os.environ.get("FANS_GENDER_SUB", "粉丝性别")
-FANS_GENDER_OPTION = os.environ.get("FANS_GENDER_OPTION", "女性居多")
-FANS_GENDER_FIELD = "fans_gender"
-FANS_GENDER_VALUE = "2"                  # 女性居多 = 2（男性居多 = 1）
+# 【已移除·2026-09-22】达人画像(达人性别=女) / 粉丝画像(粉丝性别=女性居多) 两项平台筛选
+#   —— 用户要求平台侧只留三项，这两项整体下架。
+#   达人性别仍有本地兜底（过滤循环里 `str(r["gender"]) != "2"` 直接剔）；
+#   粉丝性别**无本地兜底**（数据里没有对应字段），清掉后不再限制。
+#   原实现（apply_agg 三步走 + 常量 PORTRAIT_*/FANS_GENDER_*）见 git 历史；
+#   要恢复：export PLATFORM_EXTRA_FILTER=1（见 apply_agg 定义处的注释）。
+# 达人画像/粉丝画像是 agg 面板（.quick-filter-button-agg-pop），交互三步：
+#   ① 点该行的「请选择」 ② 点选项 ③ 点面板内「确认」。apply_agg() 仍保留给恢复路径用。
 
-# 【规则1】主推类目 = 「个护家清」（级联菜单里选「不限」= 整个个护家清大类）
-# 如需只取某个子类目，设 CATE_CHILD=个人护理 / 家清纸品
-# 用户 2026-09-15 追加：类目再加「美妆」（同样选「不限」）
-# 每批目标有效达人数见 collect_30.py 的 GHQ_TARGET / MZ_TARGET（默认各 30）
-#
-# 🔴 用户 2026-09-17 第二批要求（原话）：
-#    「在主推类目中，不对类目进行筛选，只在下方查看达人时，
-#      选择之前所要求的类目达人」
-#    → **平台侧不再筛类目**（主推类目留「全部」），类目要求改由**本地规则4**
-#      `cate_verdict(author_tag.main_cate)` 把关 —— 那正是列表里每行显示的
-#      那串类目标签（如「个护家清, 美妆」），也就是「在下方查看达人时挑人」。
-#    探针 .probe/probe_square.py 已确认：页面**没有**叫「查看达人」的控件，
-#    唯一的类目控件就是「主推类目」这一行 chips。
-#    想恢复旧的平台侧筛选：export PLATFORM_CATE_FILTER=1
+# 【规则1 / 平台侧主推类目】2026-09-22 起**重新放回平台侧筛选**（级联选子类目）
+#   用户 2026-09-22 原话：「个护家清选择个人护理，美妆则选择不限」：
+#     批①  CATE_PARENT=个护家清  CATE_CHILD=个人护理   -> main_cate_new=["5"]
+#                                                         + common_selection_first_cate_code=["1000003462"]
+#     批②  CATE_PARENT=美妆      CATE_CHILD=不限       -> main_cate_new=["9"]
+#   由 collect_30.py 分批驱动（每批一个 (parent, child) 组合），
+#   也可直接 export CATE_PARENT=美妆 CATE_CHILD=不限 单跑。
+#   ⚠️ 2026-09-17~09-21 期间曾「平台侧不筛类目、只靠本地规则4」，那是历史口径，已作废；
+#      现在**两边都要**：平台侧先按级联圈定大类，本地规则4 再按列表类目标签兜一道。
 CATE_PARENT = os.environ.get("CATE_PARENT", "个护家清")
-CATE_CHILD = os.environ.get("CATE_CHILD", "不限")
+CATE_CHILD = os.environ.get("CATE_CHILD", "个人护理")
 CATES = ((CATE_PARENT, CATE_CHILD),)
+# 保留该开关是为了能在排错时临时关掉平台侧类目（默认开）。
+# 关掉：export PLATFORM_CATE_FILTER=0（此时只剩内容类型 + 结算额两项平台筛选）
 PLATFORM_CATE_FILTER = os.environ.get(
-    "PLATFORM_CATE_FILTER", "0").lower() not in ("0", "false", "no", "off", "")
+    "PLATFORM_CATE_FILTER", "1").lower() not in ("0", "false", "no", "off", "")
 
 # 规则3：带货商品全部来自同一家 -> 跳过该达人
 # 店铺名归一化后缀（用于取品牌名做同源判断）
@@ -401,65 +391,11 @@ SHOP_SUFFIX = ("官方海外旗舰店", "官方旗舰店", "旗舰店", "专卖�
 
 # 【规则4】主推类目（author_tag.main_cate 是**顶级类目数组**，
 #        实测形如 ["个护家清","服饰内衣","美妆"]）
-#   —— 用户 2026-09-15 最新口径：
-#     ① 必须命中「个护家清」或「美妆」之一；
-#     ② 目标类目词条 = 个护家清 / 美妆 / 服饰内衣 / 母婴宠物 / 运动户外：
-#        · 命中 >= 2 个 -> 直接通过，**第三个及以后的类目不做任何限制**
-#          （例：个护家清/母婴宠物/食品饮料 ✔，个护家清/美妆/食品饮料 ✔）
-#        · 只命中 1 个 -> 再查是否带下方 18 个被排除的搭档类目，带了就排除
-#          （例：个护家清 ✔；美妆 ✔；个护家清/食品饮料 ✘）
-#     最终放行组合：个护家清｜个护家清+美妆｜美妆｜个护家清+服饰内衣｜
-#                  个护家清+母婴宠物｜个护家清+运动户外
-CATE_TARGETS = ("个护家清", "美妆", "服饰内衣", "母婴宠物", "运动户外")
+#   —— 用户 2026-09-22 最新口径（**已简化，只剩一条**）：
+#     「主推类目必须命中个护家清/美妆其一」
+#   已删除（原实现见 git 历史）：CATE_TARGETS 的 >=2 二次判定、
+#   以及只中一个时查 18 项 CATE_EXCLUDE_PARTNER 搭档类目的 "catecombo" 分支。
 CATE_MUST_ANY = ("个护家清", "美妆")
-# 只命中 1 个目标类目时，出现以下任一类目即排除（18 项）
-CATE_EXCLUDE_PARTNER = (
-    "食品饮料", "滋补保健", "宠物", "图书教育", "生鲜", "本地生活", "酒",
-    "智能家居", "玩具乐器", "鲜花园艺", "3C数码家电", "鞋靴箱包", "虚拟充值",
-    "钟表配饰", "珠宝文玩", "医疗健康", "原料包装", "餐饮外卖",
-)
-
-# ===========================================================================
-# 【分支 Z】A 阶段的新筛选口径（用户 2026-09-19 定；原话见 RUNBOOK「分支 Z」）
-# 🔴 用户 2026-09-19 追加定调：「以后按照 A（分支Z）-B-C 执行，
-#    不要再询问用哪个分支，**默认按分支 Z**」-> 默认值已改为 Z。
-#   FILTER_PROFILE=Z（默认）= 启用下面这套（现行口径）
-#   FILTER_PROFILE=A        = 历史规则（上面那套），仅回溯/对比时用
-# 另见规则3f（单一店铺占比 >=50% 跳过，只在 Z 下生效，常量 SHOP_SHARE_RATIO）
-#
-# 用户原话要点：
-#   「销售结算额为 1-10W；主词条：个护家清、美妆二选一；副词条：服饰内衣、
-#     母婴宠物、滋补保健，必须包含一条以上主词条，副词条随意；也可两个主词条
-#     组合（个护家清/美妆）；也可以只有一个词条（只含美妆、或只含个护家清），
-#     但限制规则：在只有个护美妆的达人中，第二个词条要包含 时尚、情感、剧情、
-#     颜值、音乐、舞蹈、亲子 这些类目中的一个」
-#   「筛除昵称包含 香港/专场/供应链/品牌/折扣/养发/植发/工厂/美甲/睫毛/草本
-#     这些词；达人地址去除 新疆、西藏、海南、海外」
-#
-# 落成规则（Z 分支）：
-#   Z1 结算额：直播结算总额 = 1w-10w（与 A 同：SETTLE_MIN/MAX = 10000/100000）
-#   Z2 主词条：main_cate 必须命中 Z_MAIN 里 >=1 个，否则判 "z_nocate"
-#   Z3 两个主词条全中（个护家清+美妆）-> 直接放行，第三个及以后类目不再限制
-#      （= 用户说的「如包含前两个，则不考虑第三个词条」）
-#   Z4 只中一个主词条：
-#        · 主推类目里**还有别的类目**（含副词条 服饰内衣/母婴宠物/滋补保健）
-#          -> 放行（「副词条随意，也可进行添加」）
-#        · 主推类目里**只有那一个主词条**（=「只有个护美妆的达人」）
-#          -> 内容类型必须命中 Z_SINGLE_CONTENT 之一，否则判 "z_single"
-#   Z5 内容类型黑名单：Z 分支**不启用** A 分支的 CONTENT_EXCLUDE
-#      （内容类型只在 Z4 那条「单主词条」场景里把关）
-#      —— 想恢复黑名单：export Z_CONTENT_BLACKLIST=1
-#   Z6 昵称排除词 / 地区排除：见 nick_rules.py 与 EXCLUDE_REGION，两分支共用
-#      （Z 追加的昵称词已并入 nick_rules.py 的 NICK_EXCLUDE_KW）
-# ===========================================================================
-FILTER_PROFILE = (os.environ.get("FILTER_PROFILE", "Z") or "Z").strip().upper()
-Z_MAIN = ("个护家清", "美妆")                 # 主词条（二选一或全选）
-Z_SUB = ("服饰内衣", "母婴宠物", "滋补保健")    # 副词条（随意，不作硬条件）
-# 只含一个主词条且没有别的类目时，内容类型必须命中这里的一个
-Z_SINGLE_CONTENT = ("时尚", "情感", "剧情", "颜值", "音乐", "舞蹈", "亲子")
-# Z 分支是否仍套用 A 分支的内容类型黑名单（默认关闭）
-Z_CONTENT_BLACKLIST = os.environ.get(
-    "Z_CONTENT_BLACKLIST", "0").lower() not in ("0", "false", "no", "off", "")
 
 # 【规则3b】带货**商品名称**命中以下词 -> 排除该达人
 #   3b 用户 2026-09-15 追加：假发 / 院线 / 美甲
@@ -600,6 +536,54 @@ FIND_FORMITEM_JS = """(name) => {
     if (!hit) return null;
     const r = hit.getBoundingClientRect();
     return {x:Math.round(r.x), y:Math.round(r.y), w:Math.round(r.width), h:Math.round(r.height)};
+}"""
+
+# 【内容类型】专用 JS（2026-09-22 新增；探针 .probe/probe_ct_cate.py 实测验证）
+# 🔴 实测要点（省得下次再踩）：
+#   1. 收起态 DOM 里就有全部 42 个 chip，但 form-item 只有 **24px 高**，
+#      第二行被裁在可视区外 —— 按坐标点会点到别处。所以必须先点「展开」（变 64px 两行）。
+#   2. chip 是 `SPAN`，**选中后背景仍是 transparent**（不是 #EBF3FF），
+#      所以「选没选中」**不能靠颜色判断**，一律靠接口 payload 端到端校验（_filt_bad）。
+#   3. 「内容类型」form-item 的定位统一用 `innerText.startsWith('内容类型')`，
+#      与 FIND_FORMITEM_JS 的前缀匹配口径一致。
+CT_EXPAND_JS = """() => {
+    const fi = [...document.querySelectorAll('div.auxo-form-item')]
+        .find(e => (e.innerText || '').trim().startsWith('内容类型'));
+    if (!fi) return null;
+    for (const e of fi.querySelectorAll('*')) {
+        const t = (e.innerText || '').trim();
+        if (t !== '展开' && t !== '收起') continue;
+        if (e.children.length) continue;          // 只要叶子节点，别撞到外层容器
+        const r = e.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) continue;
+        return {text: t, x: Math.round(r.x), y: Math.round(r.y),
+                w: Math.round(r.width), h: Math.round(r.height)};
+    }
+    return null;
+}"""
+
+CT_CHIP_JS = """(name) => {
+    const fi = [...document.querySelectorAll('div.auxo-form-item')]
+        .find(e => (e.innerText || '').trim().startsWith('内容类型'));
+    if (!fi) return null;
+    for (const e of fi.querySelectorAll('*')) {
+        const t = (e.innerText || '').trim();
+        if (t !== name) continue;                 // 精确文本（'文化' 不会撞 '传统文化'）
+        if ([...e.children].map(c => (c.innerText || '').trim()).includes(t)) continue;
+        const r = e.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) continue;
+        return {t: t, x: Math.round(r.x), y: Math.round(r.y),
+                w: Math.round(r.width), h: Math.round(r.height)};
+    }
+    return null;
+}"""
+
+CT_READ_JS = """() => {
+    // 读「内容类型」当前回显（form-item 整体文本），仅用于日志/排错
+    const fi = [...document.querySelectorAll('div.auxo-form-item')]
+        .find(e => (e.innerText || '').trim().startsWith('内容类型'));
+    if (!fi) return null;
+    return (fi.innerText || '').replace(/\\s+/g, ' ').slice(0, 300);
 }"""
 
 FIND_CATE_JS = """(name) => {
@@ -1071,19 +1055,10 @@ CHEAP_RATIO = float(os.environ.get("CHEAP_RATIO", "0.90"))
 #   后面那个是划线原价），空值/异常给 "-"。
 PRICE_MIN_PARSE = float(os.environ.get("PRICE_MIN_PARSE", "0.80"))
 
-# 【规则3f｜分支 Z】单一**店铺**占所带商品的比例达到阈值 -> 跳过该达人
-#   用户原话（2026-09-19 追加，分支 Z）：
-#     「在带货商品分析中，同一个店铺商品超过 50% 以上，
-#       一个店铺占据了 50% 的品的，不做添加」
-#   ⚠️ 题面是**店铺**（不是品牌）—— 规则3 管的是「同品牌」（跨店也可能同品牌），
-#      3f 管的是「同店铺」（同店也可能多品牌）。两者独立判定，**先命中先跳过**。
-#   成立条件刻意与规则3 对齐（两个都要满足）：
-#     ① 最大店铺占比 >= SHOP_SHARE_RATIO（默认 50%）
-#     ② 该店铺件数**严格过半**（cnt*2 > total）
-#     ② 是为了防小样本误判：2 件商品来自 2 家不同店铺时各占 50%，
-#     字面满足阈值，但显然不是「就推这一家店」。
-#   只在 FILTER_PROFILE=Z 下生效（A 分支保持历史行为不变）。
-SHOP_SHARE_RATIO = float(os.environ.get("SHOP_SHARE_RATIO", "0.50"))
+# 【已删除·2026-09-22】规则3f「单一店铺占比 >= 50% -> 跳过」+ 常量 SHOP_SHARE_RATIO
+#   —— 用户要求「分支Z专属去除」，3f 是 Z 专属规则，整体下架（原实现见 git 历史）。
+#   注意：规则3c「带货店铺家数 <= 2 跳过」（shopcnt_verdict / MIN_SHOP_CNT）**保留**，
+#   它一直属于 A 分支的常规规则，不在本次删除范围内。
 
 # 【规则3e】带货**商品名或店铺名**含 YANGFA_KW，且占比 **> YANGFA_RATIO** -> 跳过
 #   用户原话（2026-09-17）：「达人所带货商品及商品店铺带养发，且占比超过50%的，也进行剔除」
@@ -1197,43 +1172,23 @@ def shop_brand_tokens(shops):
 
 
 def cate_verdict(mc):
-    """【规则4】主推类目判定。
+    """【规则4】主推类目判定（2026-09-22 简化，只保留一条）。
+
+    用户原话：「A阶段本地规则中，规则4只保留主推类目必须命中个护家清/美妆其一，
+    分支Z专属去除。其他均不做改变」。
 
     返回 (是否通过, 命中的目标词条列表, 未通过原因)。
-      · 必须命中 CATE_MUST_ANY（个护家清 / 美妆）之一，否则 "nocate"
-      · 目标词条（个护家清/美妆/服饰内衣/母婴宠物/运动户外）命中 >= 2 个
-        -> 通过，第三个及以后的类目不做任何限制
-      · 只命中 1 个 -> 带 CATE_EXCLUDE_PARTNER 任一项则 "catecombo"
+      · main_cate 命中「个护家清」或「美妆」**其一** -> 通过
+      · 一条都没命中 -> (False, [], "nocate")
+    ⚠️ 已删除（原实现见 git 历史）：
+      · `CATE_TARGETS` 命中 >=2 的二次判定
+      · 只命中 1 个时查 `CATE_EXCLUDE_PARTNER`（18 项搭档类目）-> "catecombo"
     """
     mc = mc or []
-    if not any(c in CATE_MUST_ANY for c in mc):
-        return False, [], "nocate"
-    hits = [c for c in mc if c in CATE_TARGETS]
-    if len(hits) >= 2:
+    hits = [c for c in mc if c in CATE_MUST_ANY]
+    if hits:
         return True, hits, ""
-    if any(x in CATE_EXCLUDE_PARTNER for x in mc):
-        return False, hits, "catecombo"
-    return True, hits, ""
-
-
-def z_verdict(main_cate, content_type):
-    """【分支 Z】主推类目 + 内容类型判定。返回 (是否通过, 主词条命中数, 未通过原因)。
-
-    规则见文件上方「分支 Z」注释块 Z2~Z4。故意写成纯函数，方便进 test_rules.py 回归。
-    """
-    mc = list(main_cate or [])
-    hits = [c for c in Z_MAIN if c in mc]
-    if not hits:
-        return False, 0, "z_nocate"                      # Z2：一条主词条都没有
-    if len(hits) >= 2:
-        return True, len(hits), ""                       # Z3：两个主词条全中 -> 放行
-    others = [c for c in mc if c not in Z_MAIN]
-    if others:
-        return True, 1, ""                               # Z4a：还有别的类目 -> 放行
-    ct = list(content_type or [])
-    if any(c in Z_SINGLE_CONTENT for c in ct):
-        return True, 1, ""                               # Z4b：第二个词条达标
-    return False, 1, "z_single"                          # Z4b：只有个护/美妆 且内容类型不达标
+    return False, [], "nocate"
 
 
 def product_exclude_hit(titles):
@@ -1292,28 +1247,6 @@ def shopcnt_verdict(shops):
     """
     uniq = sorted({s.strip() for s in (shops or []) if s and s.strip()})
     return len(uniq) <= MIN_SHOP_CNT, len(uniq), uniq
-
-
-def shopshare_verdict(shops):
-    """【规则3f｜分支 Z】单一店铺占比判定（只推一家店的铺货号）。
-
-    返回 (是否跳过, 最大占比, 店铺名, 商品总件数, 最大店铺件数)。
-    口径与 `brand_verdict` 完全对齐：占比 >= SHOP_SHARE_RATIO **且** 件数严格过半。
-    与 `shopcnt_verdict` 一致，只认店铺名本身（不模糊归并，宁可漏杀不可错杀）。
-    纯函数，便于回归。
-    """
-    rows = [s.strip() for s in (shops or []) if s and s.strip()]
-    total = len(rows)
-    if not total:
-        return False, 0.0, "", 0, 0
-    cnt = {}
-    for s in rows:
-        cnt[s] = cnt.get(s, 0) + 1
-    name = max(cnt, key=lambda k: (cnt[k], k))
-    n = cnt[name]
-    ratio = n / float(total)
-    skip = (ratio >= SHOP_SHARE_RATIO) and (n * 2 > total)
-    return skip, ratio, name, total, n
 
 
 def yangfa_verdict(prows):
@@ -1647,8 +1580,13 @@ def main():
             return False
 
         def _filt_bad(filt):
-            """检查一份 payload filters 是否满足当前全部筛选要求，返回问题列表。"""
+            """检查一份 payload filters 是否满足当前全部筛选要求，返回问题列表。
+
+            2026-09-22 口径变更后**只校验三项**：结算额 + 主推类目(含子类目) + 内容类型。
+            （粉丝量/有联系方式/达人画像/粉丝画像 已从平台侧整体移除，不再校验。）
+            """
             bad = []
+            # ① 直播结算总额 = 1w-10w
             fld = SALE_FIELD_BY_LABEL.get(SALE_LABEL, SALE_LABEL)
             want_sale = sorted(RANGE_VALUE[o] for o in
                                [x.strip() for x in SALE_OPTION.split("|") if x.strip()]
@@ -1656,31 +1594,25 @@ def main():
             got_sale = sorted(str(x) for x in (filt.get(fld) or []))
             if got_sale != want_sale:
                 bad.append("%s=%s(期望%s)" % (fld, got_sale, want_sale))
-            want_fans = RANGE_VALUE.get(FANS_OPTION)
-            got_fans = [str(x) for x in (filt.get(FANS_FIELD) or [])]
-            if got_fans != [want_fans]:
-                bad.append("%s=%s(期望['%s'])" % (FANS_FIELD, got_fans, want_fans))
-            if not filt.get(CONTACT_FIELD):
-                bad.append("%s=%s(期望非空)" % (CONTACT_FIELD, filt.get(CONTACT_FIELD)))
-            # 类目：**只有开了平台侧筛选才校验**（用户 2026-09-17 起默认不在平台筛类目，
-            # 改由本地规则4 `cate_verdict(author_tag.main_cate)` 按列表里的类目标签挑人）
+            # ② 主推类目（级联）：父类目 id 必须出现；选了具体子类目时还须带子类目 code
             if PLATFORM_CATE_FILTER:
                 want_cate = CATE_ID_BY_NAME.get(CATE_PARENT)
                 got_cate = [str(x) for x in (filt.get(CATE_FIELD) or [])]
-                if want_cate and (not got_cate or got_cate[0] != want_cate):
-                    bad.append("%s=%s(期望%s)" % (CATE_FIELD, got_cate, want_cate))
-            # 达人画像 -> 达人性别 = 女（2026-09-17 追加）
-            if PORTRAIT_OPTION and PORTRAIT_OPTION not in ("不限", "0", "off", "none"):
-                got_p = [str(x) for x in (filt.get(PORTRAIT_FIELD) or [])]
-                if PORTRAIT_VALUE not in got_p:
-                    bad.append("%s=%s(期望含'%s')" % (
-                        PORTRAIT_FIELD, got_p, PORTRAIT_VALUE))
-            # 粉丝画像 -> 粉丝性别 = 女性居多（2026-09-17 追加）
-            if FANS_GENDER_OPTION and FANS_GENDER_OPTION not in ("不限", "0", "off", "none"):
-                got_fg = [str(x) for x in (filt.get(FANS_GENDER_FIELD) or [])]
-                if FANS_GENDER_VALUE not in got_fg:
-                    bad.append("%s=%s(期望含'%s')" % (
-                        FANS_GENDER_FIELD, got_fg, FANS_GENDER_VALUE))
+                if want_cate and want_cate not in got_cate:
+                    bad.append("%s=%s(期望含%s)" % (CATE_FIELD, got_cate, want_cate))
+                if CATE_CHILD and CATE_CHILD != "不限":
+                    got_sub = [str(x) for x in (filt.get(CATE_CHILD_FIELD) or [])]
+                    if not got_sub:
+                        bad.append("%s=%s(期望非空/子类目「%s」)"
+                                   % (CATE_CHILD_FIELD, got_sub, CATE_CHILD))
+            # ③ 内容类型：勾选项必须**逐项**都在 payload 里（平台回显即中文名）
+            if CONTENT_TYPES:
+                got_ct = [str(x) for x in (filt.get(CONTENT_TYPE_FIELD) or [])]
+                miss = [c for c in CONTENT_TYPES if c not in got_ct]
+                if miss:
+                    bad.append("%s 缺 %d 项:%s(实际 %d 项)"
+                               % (CONTENT_TYPE_FIELD, len(miss), "/".join(miss[:6]),
+                                  len(got_ct)))
             return bad
 
         def verify_filters():
@@ -1762,6 +1694,62 @@ def main():
                     log("  [cat] %s > %s 已选中（面板已收起）" % (parent, child))
                     return True
             return False
+
+        def apply_content_types():
+            """【内容类型】平台侧筛选：先点 form-item 右侧「展开」，再逐个点 chip。
+
+            2026-09-22 用户原话：「内容类型时，先在右侧点击展开，然后再按图中所选进行筛选」。
+            🔴 为什么必须先展开：收起态 form-item 只有 **24px 高**，第二行的 chip
+               （如「影视」「其他」）被裁在可视区外 —— 按坐标点会点到别的东西。
+               探针实测：展开前后 DOM 里都是 42 个 chip，但只有展开后（64px 两行）才都点得到。
+            ⚠️ chip 是 SPAN，选中态背景仍是 transparent -> **不能靠颜色判断选中**，
+               命中情况一律交给后面的 payload 校验（_filt_bad）兜底。
+            """
+            if not CONTENT_TYPES:
+                return True
+            if not page.evaluate(FIND_FORMITEM_JS, CONTENT_TYPE_LABEL):
+                log("  [ct] 未找到筛选项「%s」" % CONTENT_TYPE_LABEL)
+                return False
+            # ① 展开（按钮已经在「收起」态时说明本来就展开着 -> 不动它）
+            expanded = False
+            for attempt in range(3):
+                ex = page.evaluate(CT_EXPAND_JS)
+                if not ex:
+                    log("  [ct] 没找到「展开/收起」按钮（第%d/3次）" % (attempt + 1))
+                    time.sleep(1.2)
+                    continue
+                if ex["text"] == "收起":
+                    log("  [ct] 「内容类型」已是展开态（按钮=收起）")
+                    expanded = True
+                    break
+                click_box(ex)
+                time.sleep(1.2)
+                ex2 = page.evaluate(CT_EXPAND_JS)
+                if ex2 and ex2["text"] == "收起":
+                    log("  [ct] 已点「展开」-> 按钮变为「收起」")
+                    expanded = True
+                    break
+                log("  [ct] 点「展开」后按钮仍是 %s，重试"
+                    % (ex2["text"] if ex2 else "(找不到)"))
+                time.sleep(1.0)
+            if not expanded:
+                log("  [ct] !! 「展开」没能点开 —— 后面很可能有 chip 点不到")
+            # ② 逐个点选（每次都重新定位：点一下就会触发请求 + 重排，坐标会变）
+            miss, done = [], 0
+            for name in CONTENT_TYPES:
+                c = page.evaluate(CT_CHIP_JS, name)
+                if not c:
+                    miss.append(name)
+                    continue
+                click_box(c, 0.9)
+                done += 1
+            if miss:
+                log("  [ct] !! 这些「内容类型」chip 没点到: %s" % "/".join(miss))
+                log("  [ct] 回显: %s" % (page.evaluate(CT_READ_JS) or "(空)"))
+                return False
+            log("  [ct] 已点选 %d/%d 项内容类型: %s"
+                % (done, len(CONTENT_TYPES), "/".join(CONTENT_TYPES)))
+            return True
 
         # ---------- 一轮筛选 ----------
         log("=" * 66)
@@ -1942,10 +1930,25 @@ def main():
             sys.exit(3)          # 退出码 3 = 一直没登录上（驱动层应整体中止）
         log("登录态正常：%s" % login_why)
 
-        # 🔴 用户 2026-09-17 起：**平台侧不筛类目**（主推类目留「全部」），
-        #    类目要求改由本地规则4 按列表里的类目标签挑人（见 PLATFORM_CATE_FILTER 注释）。
+        # 🔴 2026-09-22 平台侧只剩三项：结算额 + 主推类目(级联) + 内容类型。
+        #    其余（粉丝量/有联系方式/达人画像/粉丝画像）已整体移除，见文件上方常量注释。
+        #
+        # ① 直播结算总额 = 1w-10w
+        #    用户 2026-09-16 改：结算总额 -> 直播结算总额。
+        #    字段 common_range_selection_live_sales_30d_settle（只认直播带货的结算额）。
+        #    单一选项，单选即可；要拼多档用 `|` 分隔（该下拉支持多选）。
+        ok_sale = True
+        for _opt in [o.strip() for o in SALE_OPTION.split("|") if o.strip()]:
+            ok_sale = apply_formitem(SALE_LABEL, _opt, "sale") and ok_sale
+
+        # ② 内容类型（先点「展开」，再点选 13 项）
+        ok_ct = apply_content_types()
+
+        # ③ 主推类目级联：个护家清 > 个人护理 ／ 美妆 > 不限
+        #    ⚠️ 放在最后：级联面板是覆盖式浮层，收尾按 Escape 关掉，避免盖住别的控件。
+        cate_ok = True
         if PLATFORM_CATE_FILTER:
-            log("应用筛选：类目 = %s" % " > ".join("/".join(c) for c in CATES))
+            log("应用筛选：主推类目 = %s" % " > ".join("/".join(c) for c in CATES))
             cate_ok = False
             for parent, child in CATES:
                 cate_ok = apply_cate_cascade(parent, child) or cate_ok
@@ -1962,48 +1965,16 @@ def main():
                     pass
                 sys.exit(2)      # 退出码 2 = 类目没选中（驱动层可重试）
         else:
-            log("应用筛选：**平台侧不筛类目**（主推类目留「全部」）"
+            log("应用筛选：**平台侧不筛类目**（PLATFORM_CATE_FILTER=0）"
                 "-> 类目由本地规则4 按达人列表里的类目标签把关")
-        # 用户 2026-09-16 改：结算总额 -> **直播结算总额 = 1w-10w**
-        # 字段 common_range_selection_live_sales_30d_settle（只认直播带货的结算额）。
-        # 单一选项，单选即可；要拼多档用 `|` 分隔（该下拉支持多选）。
-        ok_sale = True
-        for _opt in [o.strip() for o in SALE_OPTION.split("|") if o.strip()]:
-            ok_sale = apply_formitem(SALE_LABEL, _opt, "sale") and ok_sale
-        # 粉丝量：平台 2026-09-22 把它改名成「粉丝指数」（见 FANS_LABELS 注释）。
-        # 先探测哪个标签真实存在，再应用 —— 不要无条件用第一个，否则平台改回旧名就全崩。
-        ok_fans, fans_used = False, None
-        for _lb in FANS_LABELS:
-            try:
-                if page.evaluate(FIND_FORMITEM_JS, _lb):
-                    fans_used = _lb
-                    break
-            except Exception:
-                pass
-        if fans_used is None:
-            log("  [fans] 候选标签在页面上都不存在: %s（平台可能又改名了，"
-                "用 FANS_LABELS=新名字,旧名字 覆盖）" % "/".join(FANS_LABELS))
-        else:
-            if fans_used != FANS_LABELS[0]:
-                log("  [fans] 首选标签 %s 不存在，回退用 %s"
-                    % (FANS_LABELS[0], fans_used))
-            ok_fans = apply_formitem(fans_used, FANS_OPTION, "fans")
-        ok_contact = apply_formitem("有联系方式", None, "contact")
-        # 用户 2026-09-17 追加两条（都要走 agg 面板三步：请选择 -> 选项 -> 确认）
-        #   ① 达人画像 -> 达人性别 = 女
-        #   ② 粉丝画像 -> 粉丝性别 = 女性居多
-        ok_portrait = apply_agg(PORTRAIT_LABEL, PORTRAIT_SUB, PORTRAIT_OPTION, "portrait")
-        ok_fansg = apply_agg(FANS_PROFILE_LABEL, FANS_GENDER_SUB,
-                             FANS_GENDER_OPTION, "fansg")
         time.sleep(4)
 
         # 🔴 筛选项只要有一个没应用成功，就**直接中止**，绝不继续采。
         #    踩过（2026-09-17）：「粉丝量」的点击被上一个字段的下拉浮层盖住，
         #    3 次尝试全失败，但脚本照样跑完，采出一批**没有粉丝量约束**的名单。
-        if not (ok_sale and ok_fans and ok_contact and ok_portrait and ok_fansg):
-            log("!! 筛选应用失败（sale=%s fans=%s contact=%s portrait=%s fansg=%s）"
-                "-> 中止本次采集"
-                % (ok_sale, ok_fans, ok_contact, ok_portrait, ok_fansg))
+        if not (ok_sale and ok_ct and cate_ok):
+            log("!! 筛选应用失败（sale=%s ctype=%s cate=%s）-> 中止本次采集"
+                % (ok_sale, ok_ct, cate_ok))
             try:
                 page.screenshot(path=os.path.join(OUT, "filter_fail.png"))
             except Exception:
@@ -2260,12 +2231,11 @@ def main():
         seen, picked = set(), []
         stat = {"dup": 0, "male": 0, "region": 0, "noprov": 0, "settle": 0,
                 "fans": 0,
-                "nocate": 0, "catecombo": 0, "content": 0, "contentkeep": 0,
-                "nickkw": 0, "nickbrand": 0, "unauth": 0,
-                "z_nocate": 0, "z_single": 0}      # 分支 Z 的两个新判定结果
+                "nocate": 0, "content": 0, "contentkeep": 0,
+                "nickkw": 0, "nickbrand": 0, "unauth": 0}
         nick_drop = []                  # 记录被昵称规则剔除的样本，便于核对
         content_drop = []               # 记录被内容类型剔除的样本（新规则上线后要能核对）
-        cate_drop = []                  # 记录被类目规则剔除的样本（A 的 nocate/catecombo、Z 的两个）
+        cate_drop = []                  # 记录被类目规则剔除的样本（规则4 的 nocate）
         settle_drop = []                # 记录被规则2b（结算额兜底）剔除的样本
         fans_drop = []                  # 规则2d（粉丝量兜底）剔除的样本
         unauth_drop = []                # 规则2c：因「未授权数据 + 等级够」被放行的样本
@@ -2312,16 +2282,10 @@ def main():
                             settle_drop.append("%s(live=%s)" % (
                                 (r["nickname"] or "")[:16], _note))
                         continue
-            # 规则4：主推类目 —— 命中「个护家清/美妆」其一；
-            #        目标词条命中 >=2 个 -> 第三个及以后的类目不做限制；
-            #        仅命中 1 个 -> 才查 18 项搭档排除表
+            # 规则4（2026-09-22 简化）：主推类目必须命中「个护家清/美妆」其一
             mc = r.get("main_cate") or []
             ct = r.get("content_type") or []
-            if FILTER_PROFILE == "Z":
-                # 【分支 Z】主词条/副词条/第二个词条 那套口径（见文件上方 Z2~Z5）
-                ok_cate, cate_hits, why = z_verdict(mc, ct)
-            else:
-                ok_cate, cate_hits, why = cate_verdict(mc)
+            ok_cate, cate_hits, why = cate_verdict(mc)
             if not ok_cate:
                 stat[why] += 1
                 if len(cate_drop) < 40:
@@ -2329,13 +2293,8 @@ def main():
                         (r["nickname"] or "")[:14], "/".join(mc), "/".join(ct)))
                 continue
             r["cate_hits"] = cate_hits
-            r["filter_profile"] = FILTER_PROFILE
-            # 规则6：内容类型
-            #   A 分支：白名单优先，未命中白名单时看黑名单
-            #   Z 分支：默认**不套黑名单**（内容类型已在 z_verdict 的 Z4b 把关）
-            if FILTER_PROFILE == "Z" and not Z_CONTENT_BLACKLIST:
-                pass
-            elif any(c in CONTENT_KEEP for c in ct):
+            # 规则6：内容类型 —— 白名单优先，未命中白名单时才看黑名单
+            if any(c in CONTENT_KEEP for c in ct):
                 stat["contentkeep"] += 1
             elif any(c in CONTENT_EXCLUDE for c in ct):
                 stat["content"] += 1
@@ -2354,16 +2313,14 @@ def main():
                 continue
             seen.add(k)
             picked.append(r)
-        log("  筛选口径：分支 %s%s" % (
-            FILTER_PROFILE,
-            "（主词条 个护家清/美妆；副词条 服饰内衣/母婴宠物/滋补保健 随意；"
-            "只含一个主词条时内容类型需命中 %s）" % "/".join(Z_SINGLE_CONTENT)
-            if FILTER_PROFILE == "Z" else "（历史规则）"))
+        log("  筛选口径：平台侧 = 主推类目(%s>%s) + 内容类型(%d项) + %s(%s)；"
+            "本地规则4 = 主推类目必须命中 个护家清/美妆 其一"
+            % (CATE_PARENT, CATE_CHILD, len(CONTENT_TYPES), SALE_LABEL, SALE_OPTION))
         log("  本地过滤：重复 %d / 非女性 %d / 敏感地区 %d / 非大陆 %d "
-            "/ 粉丝超限 %d / 结算额不合格 %d / 无目标类目 %d / 排除类目组合 %d "
+            "/ 粉丝超限 %d / 结算额不合格 %d / 无目标类目 %d "
             "/ 排除内容类型 %d / 昵称排除词 %d / 昵称品牌 %d -> 保留 %d" % (
                 stat["dup"], stat["male"], stat["region"], stat["noprov"],
-                stat["fans"], stat["settle"], stat["nocate"], stat["catecombo"],
+                stat["fans"], stat["settle"], stat["nocate"],
                 stat["content"], stat["nickkw"], stat["nickbrand"], len(picked)))
         if LOCAL_FANS_FILTER:
             log("  规则2d 粉丝量兜底：粉丝 <= %d（本地再拦一道；平台侧该项已改名「粉丝指数」）"
@@ -2380,14 +2337,8 @@ def main():
                 % (SALE_LABEL, SETTLE_MIN, SETTLE_MAX))
         else:
             log("  规则2b 结算额兜底：已关闭（LOCAL_SETTLE_FILTER=0）")
-        if FILTER_PROFILE == "Z":
-            log("  分支Z 类目判定：无主词条(z_nocate) %d 个 / 只含单主词条且内容类型不达标(z_single) %d 个"
-                % (stat["z_nocate"], stat["z_single"]))
-            log("  分支Z 内容类型黑名单：%s"
-                % ("已启用（Z_CONTENT_BLACKLIST=1）" if Z_CONTENT_BLACKLIST else "已关闭（只在单主词条场景看内容类型）"))
-        else:
-            log("  内容类型白名单（%s）另有 %d 个达人被明确保留"
-                % ("/".join(CONTENT_KEEP), stat["contentkeep"]))
+        log("  内容类型白名单（%s）另有 %d 个达人被明确保留"
+            % ("/".join(CONTENT_KEEP), stat["contentkeep"]))
         if settle_drop:
             log("  结算额被剔除样本：%s" % " | ".join(settle_drop))
         if fans_drop:
@@ -2563,26 +2514,7 @@ def main():
                                             i, cand_n, nick18, scnt, MIN_SHOP_CNT,
                                             "：" + "/".join(slist[:3])))
                                     break
-                                # --- 规则3f（分支 Z）：单一店铺占所带商品 >=50% -> 跳过 ---
-                                # 用户 2026-09-19 追加：「同一个店铺的商品超过 50%，
-                                # 一个店铺占据了 50% 的品的，不做添加」
-                                shskip, shratio, shname, shtotal, shcnt = \
-                                    False, 0.0, "", 0, 0
-                                if FILTER_PROFILE == "Z":
-                                    shskip, shratio, shname, shtotal, shcnt = \
-                                        shopshare_verdict(shops)
-                                    r["top_shop"] = shname
-                                    r["top_shop_ratio"] = round(shratio, 3)
-                                    r["top_shop_cnt"] = shcnt
-                                    if shskip:
-                                        r["skip_reason"] = "单店铺%.0f%%:%s" % (
-                                            shratio * 100, shname)
-                                        verdict_cache[r["uid"]] = "skip"
-                                        log("   [%d/%d] %-20s 同一店铺「%s」占 %.0f%%"
-                                            "（%d/%d 件，>=%.0f%%）-> 跳过该达人" % (
-                                                i, cand_n, nick18, shname, shratio * 100,
-                                                shcnt, shtotal, SHOP_SHARE_RATIO * 100))
-                                        break
+                                # （规则3f「单一店铺占比>=50%跳过」已于 2026-09-22 随分支Z一并删除）
                                 if skip:
                                     r["skip_reason"] = "带货同源%.0f%%:%s" % (ratio * 100, brand)
                                     verdict_cache[r["uid"]] = "skip"
@@ -2601,10 +2533,9 @@ def main():
                                     log("   [%d/%d] %-20s 昵称含带货品牌「%s」-> 跳过" % (
                                         i, cand_n, nick18, bhit))
                                     break
-                                log("   [%d/%d] %-20s 店铺 %d 家（最大「%s」%.0f%%）"
-                                    " / 品牌最大 %.0f%% -> 继续查联系方式" % (
-                                        i, cand_n, nick18, scnt, shname or "-",
-                                        shratio * 100, ratio * 100))
+                                log("   [%d/%d] %-20s 店铺 %d 家 / 品牌最大 %.0f%%"
+                                    " -> 继续查联系方式" % (
+                                        i, cand_n, nick18, scnt, ratio * 100))
                             else:
                                 # 用户要求：带货分析这一步必须真正执行 ——
                                 # 拿不到商品数据就无法判定，不能直接进入下一步，只能换人
