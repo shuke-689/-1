@@ -210,6 +210,10 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
   → 走限流那条重试路径（冷却 `BATCH_COOLDOWN`）。开关 `TRUNCATION_GUARD=0` 可关。
 - **已修**：`collect_30.py` 在有批次没产出时**不再覆盖正式 `darens.json`**，只提示补跑命令。
 - 判断一批是否可信，看**候选池数量是否符合该类目量级**，别只看脚本有没有报错。
+- **快速判别：正常单批要几十分钟（约 39 秒/个）；整轮只花 2~3 分钟就结束 = 几乎必是坏批**
+  （2026-09-22 18:37 实测：2 分 17 秒、仅 1 条接口响应 / 7 个达人 → `list_truncated` 护栏触发）。
+  配套信号：`ratelimit<tag>.txt` 内容为 `list_truncated 接口响应仅 N 条`。
+  ⇒ 坏批时 `darens.json` / `darens<tag>.json` 的 **mtime 不变**，可用它秒验「现场有没有被破坏」。
 
 **筛选条件与业务规则**：全部见 `RUNBOOK.md` 第 2 节（含 7 条规则、接口字段对照、
 结算类字段表、内容类型平台选项 40 项（现行只勾 13 项）、昵称排除三层词表）。
@@ -360,6 +364,24 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 2. **「添加朋友」窗口已打开**（用户手动：微信左下角「+」→「添加朋友」）；
    用只读枚举确认：`win_io.list_windows()` 里应出现标题 `添加朋友`。
 3. 微信没被最大化的 Edge 完全遮挡。
+   （屏幕已解锁但确实被遮挡时，可 `WX_SHOT=print` 强制窗口级 PrintWindow；**别拿它绕锁屏**。）
+4. 🔴 **屏幕已解锁且在渲染**（2026-09-22 踩到）—— 锁屏下窗口"存在"但**不渲染**，
+   `read_result()` 读到**纯黑** ⇒ 可能把 sent/not_found **判错写进台账**。两条都要满足：
+   `GetForegroundWindow() != 0` 且 `win_io.screenshot_desktop()` 亮度 > 0（均值 0 = 锁屏/息屏）。
+   - ✅ 现在 `run` 会**自动体检**（`precheck_desktop()`）：桌面全黑 ⇒ 直接退出、**不写台账**。
+   - **`wechat_add.py probe` 能找到 `添加朋友 hwnd=…` ≠ 前置通过**（锁屏时 hwnd 还在，OCR 可能 0 段）。
+   - 不满足 ⇒ **不执行，只汇报原因**（解锁后再跑）。
+
+   #### 🔴🔴 锁屏「冻帧陷阱」（2026-09-22 21:13 实测翻车，别重犯）
+   曾把「全黑 ⇒ 自动改用 `win_io.print_window()`（真 PrintWindow）」当修复，
+   probe 立刻读到 4 段文字 —— **那是冻结帧**。该轮 10 张 `out/wechat/steps/run_NN_search.png`
+   **8 张逐像素完全相同**（md5 一致），10 个达人（含 6 个本该能搜到的微信号）被**误判 not_found 写入台账**。
+   已撤销（`add_results.bak_rollback_*.json`，台账 358→348）。
+   现有两道防线：① `precheck_desktop()` 全黑硬阻断；② `freeze_step()` 连续 3 张结果图逐像素相同
+   ⇒ 本轮作废不写台账（单测 `.probe/test_wechat_guard.py`，11 项）。
+   排查口诀：`ls -lat out/wechat/steps/ | head` 看**文件大小是否几乎一致**。
+   ⚠️ **截图"看起来有内容" ≠ 画面是活的**；`screenshot_window()` 是屏幕级 BitBlt，
+   `print_window()` 才是真 PrintWindow，**锁屏下两者都不可信**（前者全黑、后者冻帧）。
 
 **执行**
 
@@ -423,6 +445,8 @@ export LOGIN_WAIT_SEC=7200    # 2 小时，够你慢慢来
 微信窗口被最大化窗口完全遮挡会读错（实测 10 个里崩 1 个）。
 `shot()` 已加固：窗口 rect 为 0x0 时 `refresh()` + `set_foreground()` 重试 4 次，
 失败给明确报错而不是 `cannot write empty image`。
+截图来源由 `SHOT_MODE`（环境变量 `WX_SHOT`）控制：默认 `screen`（屏幕级 BitBlt）；
+`print` 强制窗口级 PrintWindow，**仅用于「屏幕已解锁但窗口被完全遮挡」**，不要拿它绕锁屏（见 §3 前置检查的冻帧陷阱）。
 
 ⚠️ B 阶段 `run()` 与 `status()` 都会先过一遍**规则7 昵称排除词**
 （`_drop_nick_excluded()`），把后来才拉黑的达人挡在外面（好友申请发出去撤不回）。

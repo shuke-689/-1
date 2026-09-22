@@ -789,6 +789,46 @@ export BATCH_COOLDOWN=300 MAX_RETRY=3      # 批次冷却 + 限流重试
 2. **「添加朋友」窗口已打开** —— 用户在微信左下角「+」→「添加朋友」。
    窗口没开时脚本报 `找不到「添加朋友」窗口（请先在微信里点「+」→「添加朋友」）`。
 3. 微信未被最大化的 Edge 完全遮挡（否则点击会打到 Edge 上）。
+   - 若确实被遮挡、但**屏幕已解锁**，可用 `WX_SHOT=print` 强制走窗口级 PrintWindow。
+   - **不要**用 `WX_SHOT=print` 去绕锁屏（见下面「冻帧陷阱」）。
+4. 🔴 **屏幕必须处于解锁且正在渲染的状态**（2026-09-22 踩到）—— 锁屏时窗口"存在"但**根本不渲染**。
+   `read_result()` 会读到**纯黑** ⇒ **可能把 sent/not_found 判错写进台账**，比不跑更糟。
+   - ✅ 现在跑 `run` 时脚本会**自动体检**（`precheck_desktop()`）：桌面截图**全黑** ⇒ 直接退出，
+     **不执行任何操作、不写台账**，日志打「前置体检未通过」。
+   - 手动判据（两条都要满足）：
+   ```bash
+   "$PY" - <<'EOF'
+   import sys; sys.path.insert(0,'.probe')
+   import ctypes, win_io
+   from PIL import ImageStat
+   print('foreground =', ctypes.windll.user32.GetForegroundWindow())   # 必须 != 0
+   im = win_io.screenshot_desktop()
+   print('brightness =', round(ImageStat.Stat(im.convert('L')).mean[0], 2))  # 必须 > 0
+   EOF
+   ```
+   - `GetForegroundWindow()==0` 或 `brightness==0` ⇒ **锁屏/息屏 → 直接不执行，只汇报原因**。
+   - 旁证：`tasklist | grep LogonUI.exe` 有进程、`OpenInputDesktop()==0` 都指向锁屏。
+   - ⚠️ **`wechat_add.py probe` 报出 `添加朋友 hwnd=…` 不代表前置通过**（锁屏下窗口对象仍在窗口树里，
+     但 OCR 可能返回 **0 段文字**）。**别只看 probe 成功就开跑。**
+   - A 阶段同款现象见「用户不在机器旁别干等」（全黑 = 屏幕锁定/息屏），但**对 B 是硬阻断而非免责**。
+
+#### 🔴🔴 锁屏下的「冻帧陷阱」（2026-09-22 21:13 实测翻车 —— 差点污染台账）
+- **错误做法（已废弃）**：桌面截图全黑 ⇒ 自动改用 `win_io.print_window(hwnd, 2)`（**真** PrintWindow）。
+  `probe` 立刻能读到 **4 段文字**，看起来"修好了"。
+- **真相**：那 4 段文字来自**冻结帧**。该轮 10 张 `out/wechat/steps/run_NN_search.png`
+  **8 张逐像素完全相同**（md5 一致）—— 9 分钟内 10 次**不同微信号**的搜索，窗口内容**纹丝不动**。
+- **后果**：10 个达人（含 **6 个本该能搜到的微信号**）全被判 `not_found` 并**写进台账**，
+  比"读不到"糟得多（`not_found` 进 `DONE_STATUS` ⇒ 会被永久跳过）。
+  已用 `out/wechat/add_results.bak_rollback_*.json` 撤销，台账 358 → 348 条。
+- **现在的两道防线**：
+  1. `precheck_desktop()` —— 桌面全黑 ⇒ **硬阻断**，不再有任何"兜底绕过"。
+  2. `freeze_step()` —— **连续 3 张结果图逐像素相同 ⇒ 判定冻结 ⇒ 本轮结果全部作废、不写台账**。
+     单测：`.probe/test_wechat_guard.py`（11 项）。
+- **排查口诀**：`ls -lat out/wechat/steps/ | head` 看图**文件大小是否几乎一致**；
+  或直接比对 md5。⚠️ **截图"看起来有内容" ≠ 画面是活的。**
+- 名词别再混：`win_io.screenshot_window()` 是**屏幕级 BitBlt**（不是 PrintWindow）；
+  `win_io.print_window()` 才是真 PrintWindow（PW_RENDERFULLCONTENT=2）。
+  锁屏下【两者都不可信】：前者全黑、后者**冻帧**。
 
 ### 3.2 运行
 

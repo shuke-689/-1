@@ -27,6 +27,7 @@
 已 sent / already / excluded / not_found 的达人下一轮自动跳过，不会重复处理。
 """
 import csv
+import hashlib
 import io
 import json
 import os
@@ -60,6 +61,78 @@ RISK_KW = ("操作过于频繁", "请稍后再试", "稍后再试", "操作频�
 #   sent=已发申请 / already=已是好友 / excluded=命中排除词(稿费) / not_found=搜不到
 # 不计入：unknown(结果页无法识别)、error、risk_control -> 下次会重试
 DONE_STATUS = ("sent", "already", "excluded", "not_found")
+
+# 【截图来源】2026-09-22 晚 **修正版**（此前的 auto 兜底是错的，已撤）
+#   screen（默认）：只用屏幕级 BitBlt —— 正常路径
+#   print         ：强制走窗口级 PrintWindow —— **仅手动**用于「屏幕已解锁但窗口被完全遮挡」
+#
+# 🔴 2026-09-22 21:13 实测翻车记录（勿走回头路）：
+#   会话锁屏时屏幕级截图全黑，当时加了「全黑就自动改用 PrintWindow」的兜底；
+#   结果 PrintWindow 返回的是**冻结帧** —— 该轮 10 张搜索截图 **8 张逐像素完全相同**
+#   （md5 一致；9 分钟内 10 次不同搜索，窗口内容纹丝不动），10 个达人被**误判 not_found**
+#   并写进台账（其中 6 个是本该能搜到的微信号）。
+#   ⇒ 结论：**桌面全黑 = 锁屏/息屏 = 硬阻断，不绕**（见 precheck_desktop()）。
+#     PrintWindow 在锁屏下「看起来有内容」，比「读不到」危险得多。
+SHOT_MODE = (os.environ.get("WX_SHOT") or "screen").strip().lower()
+
+
+def _is_blank(img):
+    """整幅近黑 = 什么都没抓到（锁屏 / 无桌面 / 窗口没渲染）。"""
+    try:
+        lo, hi = img.convert("L").getextrema()
+        return hi <= 8
+    except Exception:
+        return False
+
+
+FREEZE_LIMIT = 2      # 连续相同几次即判定冻结（含本次共 3 张结果图）
+
+
+def freeze_step(cur_md5, last_md5, streak):
+    """冻结帧检测的一步。返回 (新 streak, 是否判定为冻结)。
+
+    连续 3 张结果图逐像素相同 ⇒ 窗口根本没在渲染（streak >= FREEZE_LIMIT）。
+    纯函数、单机可测，见 .probe/test_wechat_guard.py。
+    """
+    if cur_md5 and cur_md5 == last_md5:
+        streak += 1
+    else:
+        streak = 0
+    return streak, streak >= FREEZE_LIMIT
+
+
+def precheck_desktop(hwnd):
+    """跑 B 之前的硬体检。返回 (ok, reason)。
+
+    桌面截图全黑 ⇒ 锁屏 / 息屏 ⇒ **拒绝执行**（ok=False，run() 必须直接退出、
+    不写任何台账）。理由是上面的翻车记录：锁屏下 PrintWindow 会返回冻结帧。
+    """
+    try:
+        img = w.screenshot_window(hwnd)
+    except Exception as e:
+        return False, "屏幕截图异常：%s" % str(e)[:80]
+    if img is None or getattr(img, "width", 0) < 10:
+        return False, "屏幕截图失败（窗口句柄可能已失效），请确认微信窗口还在"
+    if _is_blank(img):
+        return False, ("桌面截图**全黑** —— 会话已锁屏/息屏，微信窗口不渲染。"
+                       "此时任何抓图都可能是冻结帧，宁可不开跑。请**解锁屏幕**后重跑。")
+    return True, ""
+
+
+def grab_window(hwnd):
+    """抓窗口画面，返回 (PIL.Image, 来源)。
+
+    默认只走屏幕级 BitBlt。`WX_SHOT=print` 才强制 PrintWindow
+    （手动场景：屏幕已解锁、但窗口被其它窗口**完全遮挡**时）。
+    """
+    if SHOT_MODE == "print":
+        try:
+            pi, ok = w.print_window(hwnd, 2)
+            if ok and getattr(pi, "width", 0) > 10:
+                return pi, "print"
+        except Exception:
+            pass
+    return w.screenshot_window(hwnd), "screen"
 RESULT_FILE = os.path.join(OUT, "add_results.json")
 CSV_FILE = os.path.join(OUT, "add_results.csv")
 # 台账状态 -> 给人看的中文标签（csv 用）
@@ -166,11 +239,22 @@ class WeChat:
             if attempt <= 1:
                 w.set_foreground(self.win)  # 可能被最大化窗口挤到后面
             time.sleep(0.9)
-        img = w.screenshot_region(*self.rect)
+        # 截图来源见 grab_window()：默认屏幕级；`WX_SHOT=print` 才走 PrintWindow。
+        # ⚠️ 锁屏下的全黑**不做兜底**（冻帧陷阱），由 precheck_desktop() 硬阻断。
+        img, src = grab_window(self.win)
+        if img is None:
+            raise RuntimeError(
+                "微信窗口截图失败（rect=%s）——窗口可能被最小化或被其他窗口完全遮挡"
+                % (self.rect,))
         if getattr(img, "width", 0) <= 0 or getattr(img, "height", 0) <= 0:
             raise RuntimeError(
                 "微信窗口截图失败（rect=%s）——窗口可能被最小化或被其他窗口完全遮挡"
                 % (self.rect,))
+        if src != getattr(self, "_last_src", None):
+            self._last_src = src
+            log("（截图来源切换为 %s）" % (
+                "窗口级 PrintWindow（WX_SHOT=print 手动指定）" if src == "print"
+                else "屏幕级 BitBlt"))
         if name:
             img.save(os.path.join(STEPS, "%s.png" % name))
         return img
@@ -316,7 +400,7 @@ def dismiss_apply_dialog():
     w.set_foreground(ah)
     time.sleep(0.6)
     arect = w.window_rect(ah)
-    it = ocr.find(ocr.ocr(w.screenshot_window(ah)), "取消", exact=True)
+    it = ocr.find(ocr.ocr(grab_window(ah)[0]), "取消", exact=True)
     if it:
         _click_rel(arect, it["cx"], it["cy"])
     else:
@@ -331,7 +415,7 @@ def detect_risk():
     ah = _find_top(ADD_TITLE)
     if not ah:
         return None
-    hit = ocr.find(ocr.ocr(w.screenshot_window(ah)), *RISK_KW)
+    hit = ocr.find(ocr.ocr(grab_window(ah)[0]), *RISK_KW)
     return hit["text"] if hit else None
 
 
@@ -371,7 +455,7 @@ def fill_apply(nick, shown, idx, dry):
     arect = w.window_rect(ah)
 
     # --- 1) 点「填入」带出常用申请语 ---
-    img = w.screenshot_window(ah)
+    img = grab_window(ah)[0]
     img.save(os.path.join(STEPS, "run_%02d_apply.png" % idx))
     before_items = ocr.ocr(img)
     before_txt = "".join(i["text"] for i in before_items if i["cy"] < 330)
@@ -379,7 +463,7 @@ def fill_apply(nick, shown, idx, dry):
     if xy:
         _click_rel(arect, xy[0], xy[1])
         time.sleep(1.6)
-        img2 = w.screenshot_window(ah)
+        img2 = grab_window(ah)[0]
         img2.save(os.path.join(STEPS, "run_%02d_filled.png" % idx))
         items2 = ocr.ocr(img2)
         after_txt = "".join(i["text"] for i in items2 if i["cy"] < 320)
@@ -392,7 +476,7 @@ def fill_apply(nick, shown, idx, dry):
         log("  ! 未找到「填入」，保留原申请语")
 
     # --- 2) 备注 = 达人名字（重新截图，因布局已上移）---
-    img = w.screenshot_window(ah)
+    img = grab_window(ah)[0]
     img.save(os.path.join(STEPS, "run_%02d_filled.png" % idx))
     lab = ocr.find(ocr.ocr(img), "备注")
     remark = (shown or nick).strip()
@@ -410,7 +494,7 @@ def fill_apply(nick, shown, idx, dry):
         log("  ! 未找到备注框")
 
     # --- 3) 确定 / 取消 ---
-    img = w.screenshot_window(ah)
+    img = grab_window(ah)[0]
     img.save(os.path.join(STEPS, "run_%02d_ready.png" % idx))
     items = ocr.ocr(img)
     if dry:
@@ -419,7 +503,7 @@ def fill_apply(nick, shown, idx, dry):
             _click_rel(arect, it["cx"], it["cy"])
         time.sleep(1.5)
         try:
-            w.screenshot_window(ah).save(os.path.join(STEPS, "run_%02d_after_cancel.png" % idx))
+            grab_window(ah)[0].save(os.path.join(STEPS, "run_%02d_after_cancel.png" % idx))
         except Exception:
             pass
         return "dry_stop"
@@ -430,7 +514,7 @@ def fill_apply(nick, shown, idx, dry):
     _click_rel(arect, it["cx"], it["cy"])
     time.sleep(2.2)
     try:
-        w.screenshot_window(ah).save(os.path.join(STEPS, "run_%02d_after_ok.png" % idx))
+        grab_window(ah)[0].save(os.path.join(STEPS, "run_%02d_after_ok.png" % idx))
     except Exception:
         pass
     return "sent"
@@ -485,8 +569,20 @@ def run(limit=0, dry=False):
     wx.ensure_front()
     log("添加朋友窗口 rect=%s" % (wx.rect,))
 
+    # 🔴 前置体检（2026-09-22 21:13 教训）：桌面全黑 = 锁屏/息屏 ⇒ 直接不跑，
+    #    且**不写任何台账**。锁屏时窗口"存在"但根本不渲染，硬跑会写出错误的
+    #    sent/not_found（比不跑更糟）。
+    ok, why = precheck_desktop(wx.win)
+    if not ok:
+        log("!! 前置体检未通过：%s" % why)
+        log("!! 本轮**未执行任何操作、未写台账**。解锁屏幕（并让微信窗口可见）后重跑即可。")
+        return
+    log("前置体检通过：桌面截图正常（非全黑）")
+
     results = []
     stop_reason = ""
+    last_md5 = ""
+    frozen_streak = 0
     for idx, d in enumerate(todo, 1):
         nick, contact = d["nickname"], d["contact"]
         st, note = "unknown", ""
@@ -494,7 +590,24 @@ def run(limit=0, dry=False):
             dismiss_apply_dialog()          # 清掉上一轮遗留的申请页
             wx.ensure_front()
             wx.search(contact)
-            st, shown, items, _ = wx.read_result("run_%02d_search" % idx)
+            st, shown, items, res_img = wx.read_result("run_%02d_search" % idx)
+
+            # 🔴 冻结帧守卫（2026-09-22 21:13 教训）：窗口没在渲染时，抓到的图可能
+            #    完全不动 —— 连续 3 张搜索结果图逐像素相同 ⇒ 判定冻结，本轮结果全部作废。
+            #    真实场景下不同微信号的搜索结果页**不可能**逐像素一致。
+            try:
+                cur_md5 = hashlib.md5(res_img.tobytes()).hexdigest()
+            except Exception:
+                cur_md5 = ""
+            frozen_streak, is_frozen = freeze_step(cur_md5, last_md5, frozen_streak)
+            if cur_md5:
+                last_md5 = cur_md5
+            if is_frozen:
+                log("!! 连续 %d 张搜索结果图**逐像素完全相同** -> 判定为冻结帧（窗口未渲染）"
+                    % (frozen_streak + 1))
+                log("!! 冻结帧会把 sent/not_found 判错（比不跑更糟）-> 本轮结果**全部作废、不写台账**")
+                log("!! 请检查：屏幕是否已解锁/亮屏、微信窗口是否正常显示；修好后重跑。")
+                return
 
             if st == "risk_control":
                 # 微信风控 —— 立即停止整个流程
