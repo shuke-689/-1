@@ -66,11 +66,24 @@ Playwright 启的 msedge **不会**跟着退出。
 1. 🔴 **`taskkill` / `tasklist` 必须用单斜杠**。
    `taskkill //F //IM msedge.exe //T` 会报「无效参数/选项 - '//F'」而**静默失败**，
    而 `tasklist //fi ... | wc -l` 会输出 **0** —— 看上去「已清干净」，其实什么都没做。
-   一定要用 `taskkill /F /IM msedge.exe /T`、`tasklist /fi "..."`。
-2. 🔴 **杀掉后 Edge 会在约 15 秒后自己重启**（带着上次的会话，又占住 profile）。
+
+2. 🔴🔴 **只准杀「自动化自己启的」msedge，绝不准 `/IM msedge.exe` 全杀**（2026-09-23 修正）
+   - 旧文档/旧脚本教的是 `taskkill /F /IM msedge.exe /T` —— 那是**把用户自己开的
+     Edge 也一起杀掉**，直接违反安全铁律 #4。2026-09-23 实测：本机 14 个 msedge
+     **全是用户自己的**（命令行含 `edge-auto` 的 **0 个**），照旧命令跑就是
+     「每轮采集都把用户的浏览器群灭一次」（用户 Edge 里正开着网页也会被杀）。
+   - 正确判据是**命令行**含 `.edge-auto`（`tasklist` 看不到命令行，须用
+     `Win32_Process.CommandLine`）。
+   - 已修：新增 `tools/kill_auto_edge.py`（**唯一实现**：取 PID → `taskkill /F /T /PID` → 轮询归零），
+     `tools/kill_edge.sh` 与 `tools/collect_more.py::kill_edge()` 都改为调它，
+     再也不会出现「杀全量 Edge」。自检：`"$PY" tools/kill_auto_edge.py --list`
+     （输出「自动化 PID: [] / 全部 msedge 数: 14」即正常）。
+
+3. 🔴 **杀掉后 Edge 会在约 15 秒后自己重启**（带着上次的会话，又占住 profile）。
    实测时间线：kill → 0/3/6/9/12 秒都是 0 → **15 秒时突然变成 13 个进程**。
    → 所以「杀完再 sleep 十几秒」是**反效果**：正好撞上 Edge 复活。
-3. 但杀完也不能**立刻**启动：Windows 侧 profile 锁还要几秒才释放。
+
+4. 但杀完也不能**立刻**启动：Windows 侧 profile 锁还要几秒才释放。
    → 折中做法：杀掉后**轮询到进程数归 0（约 1-3 秒）就立刻启动**。
 
 **做法（一行搞定）**
@@ -79,8 +92,10 @@ Playwright 启的 msedge **不会**跟着退出。
 bash tools/kill_edge.sh && "$PY" tools/collect_more.py
 ```
 
-`tools/kill_edge.sh` 就是干这个的：`taskkill`(单斜杠) → 轮询归零 → 打印剩余数 → **立即返回**
-（脚本里**不要**加 sleep）。
+`tools/kill_edge.sh` 就是干这个的：定位「命令行含 `.edge-auto` 的 msedge」→
+`taskkill /F /T /PID`（**单斜杠**）→ 轮询归零 → 打印剩余数 → **立即返回**
+（脚本里**不要**加 sleep）。核心逻辑在 `tools/kill_auto_edge.py`，bash 与
+`collect_more.py` 共用同一份，别再各自写一份。
 
 **另外：动手前先确认没有别的采集在跑**
 
@@ -88,7 +103,8 @@ bash tools/kill_edge.sh && "$PY" tools/collect_more.py
 tasklist /fi "imagename eq python.exe"    # 应该只有你要启的那一个
 ```
 残留的 `collect_more.py` / `collect.py` 会和你抢同一个 profile，两边都失败。
-清掉它们：`taskkill /F /IM python.exe /T`（**单斜杠**）。
+清掉它们：`taskkill /F /PID <pid> /T`（**优先按 PID 精确杀**；`/IM python.exe` 会
+连带杀掉用户自己/别的工作流里的 python，只在确认本机没有别的 python 任务时用）。
 
 > 2026-09-19 实际踩到：14:35 那轮 collect_more 的 python 被回收了但 msedge 活着，
 > 而且**另一个 collect_more 进程仍在后台跑**（它在同一份 `out/collect_more.log` 里
@@ -1251,6 +1267,67 @@ node out/_jscheck/test_find_close.js          # 桩 DOM 跑行为测试
   且 `darens_more1.json` 里没有 `top_shop*` 字段，**事后无法回算**。
 - 推论：**改规则要么在整条流水线开跑前改完，要么等本轮结束后重跑一轮**；
   不要指望「改完当前轮就按新规则走」。
+
+**④ 驱动器不认「今天已发多少」——续跑不传 `--baseline` 会直接超发（2026-09-23 实测）**
+- `tools/run_b_to_target.py` 里 `baseline = --baseline 参数 or 当前 sent 总数`，算的是
+  `今日已发 = 当前 sent − baseline` —— **它没有「按自然日统计」的能力**。
+- ⇒ 今日**第一次**开跑：不传也对（此刻当前 sent 恰好就是今日基线）；
+  **中途续跑 / 补发**：不传 = 基线被取成「现在」⇒ `今日已发` 归 0 ⇒ 又按 `--target 50`
+  **最多再发 50 个**（正是 ② 的放大版事故）。
+- 处置：续跑一律显式传基线
+  `"$PY" tools/run_b_to_target.py --target 50 --baseline <今日基线>`，
+  基线 = 当前 sent − 今日已发；**先 `--dry` 核对**它打印的「当前 sent」，确认推算的今日累计合理再跑。
+- 2026-09-23 实例：今日 290 起跑、续跑时 sent=330 ⇒ 传 `--baseline 290` ⇒ 正确识别今日
+  **40/50**、只补 10 个（最终 50/50 精准停在目标，未超发）。
+
+---
+
+### 3.10 ⭐⭐ B 阶段「误判 not_found」两起事故与三道防线（2026-09-23，必读）
+
+`not_found` 属 `DONE_STATUS` = **永久跳过**，误判代价极大 —— 当天一天内误判了 **15 条**。
+
+**事故 1 · 搜索框没写进去（17:24~17:28）**
+- 现象：第 1 轮 10 个达人**全判 not_found**；日志里 `连续 15 屏…` 无关，是**读结果页**读错。
+- 取证三步（**这套取证法以后通用**）：
+  1. `out/wechat/steps/run_NN_search.png` 的 **md5** —— 10 个不同微信号只有 **2 种** md5，
+     `run_10` 与 `run_01` **逐字节相同** ⇒ 一定是误判；健康轮次的 md5 全不相同。
+  2. 直接看那张 PNG：搜索框里是**残留的短文本「18」**，不是当前微信号。
+  3. 用 **`wechat_add.py probe-search <一个已知存在的微信号>`** 独立复测：也报搜不到 ⇒ 是工具坏了不是数据没了。
+- 根因：`focus_search_box()` 原来按「`cy<135` 且 **`w>40`**，取最左」挑搜索框。
+  「18」的 OCR 宽只有 **31px** → 被过滤 → 候选只剩**标题「添加朋友」** → 点到**标题栏** →
+  `Ctrl+A`/`DELETE`/粘贴全都进不了输入框 → 每次读到的都是上一张旧结果页。
+
+**事故 2 · 两个 B 并发（17:36~17:42）**
+- 现象：同一微信号 found/not_found/unknown **来回跳**；`cannot write empty image`；
+  单轮 10 个里 6 条 not_found，独立复测 **5 条是误判**。
+- 根因：误判「旧驱动进程已死」没去杀，`tools/run_b_to_target.py` 与手动单轮**同时驱动同一个微信窗口**。
+- ⚠️ **`tasklist /fi "imagename eq python.exe"` 一次为空不代表真没有** —— 要用
+  `tasklist | grep -i python` 复核。`run_b_to_target.py` 可能跑 **13 轮 / 39 分钟**，别按「几分钟没输出=死了」下结论。
+- 单进程后立刻恢复：第 7 轮发 5 个、第 8 轮发 8 个。
+
+**现在的三道防线（`wechat_add.py`，别再删）**
+1. `focus_search_box()` 按「**与『搜索』按钮同高**」定位（`search_row()`），并排除 `BOX_LABELS`
+   （标题/按钮文字）；拿不到按钮时退化为点「搜索框几何位置」。**与框内文字长短完全无关**。
+2. `search()` 粘贴后用 `box_text()` **轮询校验**（0.5s × 12，上限 6s；本机延迟实测 1~2s，
+   固定 sleep 会误判）→ 失败重试 1 次 → 仍失败 **返回 False** → 调用方判 `unknown`，**绝不写 not_found**。
+3. `not_found` 必须**独立复核一次**（再搜一遍，两次都搜不到才认定），否则判 `unknown`。
+   额外：`multi_frame_frozen()` —— 同轮 ≥5 个达人而结果图指纹去重 **≤2 种** ⇒ 判冻结帧
+   （原 `freeze_step()` 的「连续 3 张相同」**抓不到 2 帧交替**）。
+
+**新状态 `abnormal`（2026-09-23 用户截图要求「跳过」）**
+- 微信对某些账号返回「**被搜账号状态异常，无法显示**」——账号存在但状态异常（封禁/注销中/隐私限制），
+  **≠ 「无法找到该用户」**。以前不匹配任何关键词 → 落进 `unknown` → **每轮无限重试**（实测 `LYW00736` 重试 5+ 次）。
+- 现：`ABNORMAL_KW`，`read_result()` 在 not_found **之前**判；进 `DONE_STATUS`（跳过）；
+  `STATUS_LABEL` = `账号状态异常(跳过)`；`feishu_sync.STATUS_MAP` → 「添加失败」。
+
+**误判后的回滚流程**
+1. 备份：`cp out/wechat/add_results.json out/wechat/add_results.bak_before_rollback_$(date +%Y%m%d_%H%M%S).json`
+2. 把误判记录的 `add_status` 由 `not_found` 改回 `unknown`（保留 `nickname/contact` 不动）。
+3. 审计：拿「上一次的备份」当基线，diff 出**本轮新增的 not_found**，逐条 `probe-search` 复测，
+   能搜到的一律回滚。本轮实测：新增 4 条里 1 条误判。
+
+**单测**：`.probe/test_wechat_guard.py`（**26 项**，含 `freeze_step` / `multi_frame_frozen` /
+`norm_text` / `abnormal` 状态）。
 
 ---
 

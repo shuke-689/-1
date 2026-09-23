@@ -32,19 +32,36 @@
 #   3. 但也不能马上启动：Windows 侧 profile 锁要再等几秒才释放。
 #      折中：杀掉后轮询到进程归 0（约 1-3 秒）就立刻启动。
 
-count_edge() {
-    tasklist /fi "imagename eq msedge.exe" 2>/dev/null | tail -n +4 | wc -l
-}
+# 🔴 2026-09-23 修正：**只杀命令行含 `.edge-auto` 的 msedge**。
+#   旧版是 `taskkill /F /IM msedge.exe /T` —— 它把**用户自己开的 Edge 也一起杀掉**，
+#   直接违反「安全铁律 #4：清理残留 Edge 时只按命令行包含 .edge-auto\profile 精确匹配，
+#   绝不碰用户自己的 Edge」。实测本机 14 个 msedge 全是用户自己的（自动化残留 0 个），
+#   照旧版跑就是「每轮采集都把用户的浏览器群灭一次」。
+#   实测逻辑收敛到 tools/kill_auto_edge.py（bash / collect_more 共用同一份实现；
+#   tasklist 看不到命令行，所以内部用 PowerShell 的 Win32_Process.CommandLine）。
+#
+#   ⚠️ 本脚本**允许**在未 source tools/env.sh 的情况下直接跑（SKILL 里就是这么写的），
+#      所以这里自带 $PY 探测，不依赖 $PY 已导出。
+
+_self="${BASH_SOURCE[0]:-$0}"
+_self="${_self//\\//}"
+case "$_self" in
+  */*/*) _tools="${_self%/*}" ;;
+  *)     _tools="$PWD/tools" ;;
+esac
+_proj="${_tools%/*}"
+
+if [ -z "$PY" ] || [ ! -x "$PY" ]; then
+    for _p in "$HOME"/.workbuddy/binaries/python/versions/*/python.exe; do
+        [ -x "$_p" ] && PY="$_p"          # 取词法最大版本号（glob 已排序）
+    done
+fi
+: "${PY:=python}"
 
 count_py() {
     tasklist /fi "imagename eq python.exe" 2>/dev/null | tail -n +4 | wc -l
 }
 
-taskkill /F /IM msedge.exe /T >/dev/null 2>&1 || true
+"$PY" "$_tools/kill_auto_edge.py"
 
-for i in $(seq 1 20); do
-    [ "$(count_edge)" -eq 0 ] && break
-    sleep 0.5
-done
-
-echo "kill_edge: 剩余 msedge 进程 = $(count_edge) / python 进程 = $(count_py)（请立即启动采集，勿等待）"
+echo "kill_edge: python 进程 = $(count_py)（请立即启动采集，勿等待）"

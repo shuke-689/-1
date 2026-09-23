@@ -64,6 +64,8 @@ STATUS_MAP = {
     "already": "已申请",
     "not_found": "添加失败",
     "excluded": "添加失败",
+    # abnormal = 被搜账号状态异常（2026-09-23 用户要求跳过）—— 也归入「添加失败」
+    "abnormal": "添加失败",
     # error / risk_control -> 不映射（留空，下轮重试）
 }
 

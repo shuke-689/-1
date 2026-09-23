@@ -50,6 +50,10 @@ import nick_rules  # noqa: E402  规则7 词表（与 A / C 阶段共用，无�
 
 NOT_FOUND_KW = ("用户不存在", "无法找到", "没有找到", "找不到相关账号", "找不到相关内容",
                 "请检查", "不存在", "找不到")
+# 「被搜账号状态异常，无法显示」（2026-09-23 用户截图确认，要求**跳过**）
+#   ≠ 找不到该用户：账号存在但处于异常状态（封禁/注销中/隐私限制等），微信不给结果页，
+#   以前落进 unknown 会**每轮无限重试**（实测 LYW00736 反复重试 5+ 次）。
+ABNORMAL_KW = ("被搜账号状态异常", "账号状态异常")
 # 已是好友 -> 结果页是好友资料卡：有「发消息/语音聊天/视频聊天」和「朋友资料/共同群聊」
 ALREADY_KW = ("发消息", "发信息", "语音聊天", "视频聊天", "朋友资料", "共同群聊")
 EXCLUDE_NICK_KW = ("稿费",)
@@ -59,8 +63,9 @@ ADD_TITLE = "添加朋友"
 RISK_KW = ("操作过于频繁", "请稍后再试", "稍后再试", "操作频繁", "过于频繁", "请稍后重试")
 # 计入台账「已完成」的状态：这些达人以后不再重试
 #   sent=已发申请 / already=已是好友 / excluded=命中排除词(稿费) / not_found=搜不到
+#   abnormal=被搜账号状态异常（2026-09-23 用户要求：跳过）
 # 不计入：unknown(结果页无法识别)、error、risk_control -> 下次会重试
-DONE_STATUS = ("sent", "already", "excluded", "not_found")
+DONE_STATUS = ("sent", "already", "excluded", "not_found", "abnormal")
 
 # 【截图来源】2026-09-22 晚 **修正版**（此前的 auto 兜底是错的，已撤）
 #   screen（默认）：只用屏幕级 BitBlt —— 正常路径
@@ -85,6 +90,14 @@ def _is_blank(img):
         return False
 
 
+def norm_text(s):
+    """OCR 文本归一化：转小写、只留字母数字（用于「搜索框写入校验」比对）。
+
+    OCR 对下划线/点/连字符时好时坏，所以比对前先去掉非字母数字字符。
+    """
+    return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
+
+
 FREEZE_LIMIT = 2      # 连续相同几次即判定冻结（含本次共 3 张结果图）
 
 
@@ -99,6 +112,21 @@ def freeze_step(cur_md5, last_md5, streak):
     else:
         streak = 0
     return streak, streak >= FREEZE_LIMIT
+
+
+MULTI_FRAME_MIN_IDX = 5      # 同轮至少处理这么多个才做「多帧」判定
+
+
+def multi_frame_frozen(idx, seen_md5):
+    """同轮「多帧交替」守卫（2026-09-23 新增）。
+
+    背景：当天 10 个**不同**微信号的搜索结果图只出现 **2 种**指纹（两帧交替），
+    `freeze_step()` 要求的「连续 3 张完全相同」**正好抓不到**。
+    同一轮里不同微信号的结果页不可能只有一两种指纹 ⇒ 同样按冻结帧处理。
+
+    纯函数、单机可测，见 .probe/test_wechat_guard.py。
+    """
+    return idx >= MULTI_FRAME_MIN_IDX and len(seen_md5) <= 2
 
 
 def precheck_desktop(hwnd):
@@ -141,6 +169,7 @@ STATUS_LABEL = {
     "already": "已是好友",
     "excluded": "命中排除词(跳过)",
     "not_found": "搜不到(跳过)",
+    "abnormal": "账号状态异常(跳过)",
     "risk_control": "风控(停手)",
     "error": "出错(下轮重试)",
     "unknown": "无法识别(下轮重试)",
@@ -276,28 +305,85 @@ class WeChat:
         return it
 
     # ---------- 搜索框 ----------
+    # 标题 / 按钮等**非输入框**文字，绝不能被当成搜索框点击
+    BOX_LABELS = ("添加朋友", "搜索", "搜素", "取消", "关闭")
+
+    def search_row(self, items=None):
+        """搜索框所在水平行 —— 与「搜索」按钮同一中线。返回 (cy, 按钮item)。
+
+        🔴 2026-09-23 事故（务必保留这段历史）：
+        原来挑搜索框用「cy<135 且 w>40，取最左」。
+        当天窗口里残留了短文本「18」（OCR 宽 31px < 40）→ 被过滤掉 →
+        候选只剩**标题「添加朋友」**→ 点到标题栏 → Ctrl+A/DELETE/粘贴全进不了输入框 →
+        搜索框内容 10 次纹丝不动 → 读到的一直是上一次的旧结果页 →
+        10 个达人被逐条判 `not_found` 写进台账（not_found 属 DONE_STATUS = **永久跳过**）。
+        当时的取证：10 张 `run_NN_search.png` 只有 2 种 md5，`run_10` 与 `run_01` 逐字节相同，
+        且截图里搜索框内容仍是「18」；而单独 probe-search 一个**已知存在**的微信号也报搜不到。
+        改用「与搜索按钮同高」定位后，与框内文字长短完全无关。
+        """
+        items = self.items() if items is None else items
+        btn = ocr.find(items, "搜索", "搜素")
+        return (btn["cy"] if btn else 113), btn
+
     def focus_search_box(self):
         items = self.items()
-        # 搜索框：窗口顶部 (cy<135) 的输入内容/占位符，取最左边那个
-        cand = [i for i in items if i["cy"] < 135 and i["h"] < 45 and i["w"] > 40]
+        cy, btn = self.search_row(items)
+        right = (btn["cx"] - 40) if btn else 10 ** 9
+        cand = [i for i in items
+                if abs(i["cy"] - cy) <= 30 and i["cx"] < right
+                and i["h"] < 50 and i["w"] > 8
+                and not any(L in i["text"] for L in self.BOX_LABELS)]
         if cand:
             it = min(cand, key=lambda i: i["cx"])
             self.click_item(it)
         else:
-            self.click_abs(self.rect[2] // 3, 62)
+            # 兜底：点搜索框几何位置，不依赖 OCR 是否读到框内文字
+            self.click_abs(self.rect[2] // 3, cy)
         time.sleep(0.4)
 
+    def box_text(self):
+        """读回搜索框里当前的文字（用于校验输入是否真的写进去了）。"""
+        items = self.items()
+        cy, btn = self.search_row(items)
+        right = (btn["cx"] - 40) if btn else 10 ** 9
+        seg = [i for i in items
+               if abs(i["cy"] - cy) <= 30 and i["cx"] < right
+               and not any(L in i["text"] for L in self.BOX_LABELS)]
+        seg.sort(key=lambda i: i["cx"])
+        return "".join(i["text"] for i in seg).strip()
+
     def search(self, text):
-        self.focus_search_box()
-        w.send_keys(["CTRL", "A"])
-        time.sleep(0.2)
-        w.send_keys(["DELETE"])
-        time.sleep(0.25)
-        w.paste_text(text)
-        time.sleep(1.0)
+        """清框 -> 粘贴 -> **轮询校验文字真的进了框** -> 点「搜索」。
+
+        返回 True = 已发起搜索；False = 输入没写进搜索框
+        （此时结果页毫无意义，调用方只能判 unknown，**绝不能判 not_found**）。
+        """
+        want = norm_text(text)
+        for attempt in (1, 2):
+            self.focus_search_box()
+            w.send_keys(["CTRL", "A"])
+            time.sleep(0.3)
+            w.send_keys(["DELETE"])
+            time.sleep(0.5)
+            w.paste_text(text)
+            # ⚠️ 2026-09-23：本机（远程桌面 3840x2160）输入/重绘延迟可达 1~2 秒，
+            #    固定 sleep(1.0) 会把「其实写进去了」误判成失败；改成轮询最多等 6 秒。
+            got = ""
+            for _ in range(12):
+                time.sleep(0.5)
+                got = self.box_text()
+                if want and want in norm_text(got):
+                    break
+            if want and want in norm_text(got):
+                break
+            log("  ! 搜索框写入校验失败（期望 %s / 框内实际 %r）第 %d 次"
+                % (text, got, attempt))
+            if attempt == 2:
+                return False
         if not self.click_text("搜索", exact=True):
             w.send_keys(["ENTER"])
         time.sleep(3.2)
+        return True
 
     # ---------- 读结果页 ----------
     def read_result(self, shot_name=None):
@@ -306,6 +392,10 @@ class WeChat:
         rc = ocr.find(items, *RISK_KW)
         if rc:
             return "risk_control", rc["text"], items, img
+        # 「被搜账号状态异常，无法显示」要在 not_found 之前判（用户要求：跳过、不重试）
+        ab = ocr.find(items, *ABNORMAL_KW)
+        if ab:
+            return "abnormal", ab["text"], items, img
         nf = ocr.find(items, *NOT_FOUND_KW)
         if nf:
             return "not_found", nf["text"], items, img
@@ -606,13 +696,21 @@ def run(limit=0, dry=False):
     stop_reason = ""
     last_md5 = ""
     frozen_streak = 0
+    seen_md5 = set()        # 本轮出现过的结果图指纹（见下面「多帧交替」守卫）
     for idx, d in enumerate(todo, 1):
         nick, contact = d["nickname"], d["contact"]
         st, note = "unknown", ""
         try:
             dismiss_apply_dialog()          # 清掉上一轮遗留的申请页
             wx.ensure_front()
-            wx.search(contact)
+            if not wx.search(contact):
+                # 2026-09-23：输入没写进搜索框 -> 读到的必然是旧画面，只能判 unknown
+                st, note = "unknown", "搜索框写入失败"
+                log("  [%d/%d] %-18s 搜索框写入失败 -> 判 unknown（不写 not_found，下轮重试）"
+                    % (idx, len(todo), nick[:16]))
+                results.append({**d, "add_status": st, "add_note": note})
+                time.sleep(1.2)
+                continue
             st, shown, items, res_img = wx.read_result("run_%02d_search" % idx)
 
             # 🔴 冻结帧守卫（2026-09-22 21:13 教训）：窗口没在渲染时，抓到的图可能
@@ -625,11 +723,21 @@ def run(limit=0, dry=False):
             frozen_streak, is_frozen = freeze_step(cur_md5, last_md5, frozen_streak)
             if cur_md5:
                 last_md5 = cur_md5
+                seen_md5.add(cur_md5)
             if is_frozen:
                 log("!! 连续 %d 张搜索结果图**逐像素完全相同** -> 判定为冻结帧（窗口未渲染）"
                     % (frozen_streak + 1))
                 log("!! 冻结帧会把 sent/not_found 判错（比不跑更糟）-> 本轮结果**全部作废、不写台账**")
                 log("!! 请检查：屏幕是否已解锁/亮屏、微信窗口是否正常显示；修好后重跑。")
+                return
+
+            # 🔴 2026-09-23 事故补充守卫：当天 10 个**不同**微信号的搜索结果图只出现 2 种
+            #    （两帧交替）—— 上面「连续 3 张相同」的守卫**正好抓不到**。
+            #    同一轮里不同微信号的结果页不可能只有一两种指纹，所以再兜一道。
+            if multi_frame_frozen(idx, seen_md5):
+                log("!! 本轮 %d 个不同微信号的搜索结果图只出现 %d 种 -> 判定冻结帧（多帧交替）"
+                    % (idx, len(seen_md5)))
+                log("!! 本轮结果**全部作废、不写台账**；先查搜索框是否真的写进去了（search() 已加校验）")
                 return
 
             if st == "risk_control":
@@ -638,8 +746,29 @@ def run(limit=0, dry=False):
                 log("  [%d/%d] %-18s 微信风控「%s」-> 停止操作" % (
                     idx, len(todo), nick[:16], shown))
                 close_risk_dialog(items, wx)
+            elif st == "abnormal":
+                # 「被搜账号状态异常，无法显示」—— 账号存在但异常，重试也不会变，直接跳过
+                note = shown
+                log("  [%d/%d] %-18s 被搜账号状态异常 -> 跳过（不再重试）" % (
+                    idx, len(todo), nick[:16]))
             elif st == "not_found":
-                log("  [%d/%d] %-18s 搜不到（%s）-> 换下一个" % (idx, len(todo), nick[:16], shown))
+                # 🔴 2026-09-23：本机微信搜索**不稳定** —— 同一个微信号在不同时刻会给出
+                #    found / not_found / unknown 三种答案。当天两次实测各误判 10 条 / 5 条
+                #    「搜不到」（其中 ifeelgrace 等 7 条单独复测均能找到），而 not_found
+                #    属 DONE_STATUS = **永久跳过**，误判代价极大。
+                #    ⇒ not_found 必须**独立复核一次**：两次都搜不到才认定，否则判 unknown 下轮重试。
+                log("  [%d/%d] %-18s 搜不到 -> 独立复核一次（防误判）" % (idx, len(todo), nick[:16]))
+                time.sleep(1.2)
+                if wx.search(contact):
+                    st2, _shown2, _it2, _img2 = wx.read_result(None)
+                else:
+                    st2 = "search_failed"
+                if st2 == "not_found":
+                    log("  [%d/%d] %-18s 复核确认搜不到 -> not_found" % (idx, len(todo), nick[:16]))
+                else:
+                    log("  [%d/%d] %-18s 复核不一致（%s）-> 判 unknown，不写 not_found"
+                        % (idx, len(todo), nick[:16], st2))
+                    st, note = "unknown", "复核不一致: %s" % st2
             elif st == "already":
                 log("  [%d/%d] %-18s 已是好友 -> 跳过" % (idx, len(todo), nick[:16]))
             elif st == "unknown":

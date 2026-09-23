@@ -46,7 +46,8 @@ export PATH="/c/Users/<你>/.workbuddy/binaries/PortableGit/versions/1.2.0/cmd:\
 | 脚本 | 用途 |
 |---|---|
 | `tools/env.sh` | `source` 后导出 `$PY/$PYTHONPATH/$GIT`，跨机器可移植 |
-| `tools/kill_edge.sh` | **采集前必跑**：清掉占着 `.edge-auto/profile` 的残留 Edge（2026-09-19 新增，见 §6 排错表首行） |
+| `tools/kill_edge.sh` | **采集前必跑**：清掉占着 `.edge-auto/profile` 的残留 Edge（2026-09-19 新增，见 §6 排错表首行）。🔴 2026-09-23 修正：**只杀命令行含 `.edge-auto` 的 msedge** —— 旧版是 `taskkill /F /IM msedge.exe`（**杀全量 Edge，会群灭用户自己的浏览器**）；现逻辑收敛在 `tools/kill_auto_edge.py`（`--list` 可自检），bash 与 `collect_more.py` 共用 |
+| `tools/kill_auto_edge.py` | 上面那条的**唯一实现**：取 `Win32_Process.CommandLine` 含 `edge-auto` 的 msedge PID → `taskkill /F /T /PID` → 轮询归零。安全铁律 #4 的落地形态，**不要**再另写 `taskkill /IM msedge.exe` |
 | `tools/run_b_rounds.sh` | 阶段B 连跑（一直加到风控/候选加完），见 §3 |
 | `tools/collect_more.py` | **阶段A 多轮累积采集**：反复跑 `collect.py`，按「台账里没有的微信号」去重攒够 N 个，自动合并回 `darens.json`。见 §2.1 |
 | `tools/salvage_scan.py` | **候选池告急时的回收器**：扫 `out/collect/**/*.json`（含 `archive/`），捞出「有微信 + 不在台账 + 通过当前全部规则」的达人。`--merge` 直接并入名单（不重开浏览器）。见 RUNBOOK §3.2.2 |
@@ -62,6 +63,31 @@ export PATH="/c/Users/<你>/.workbuddy/binaries/PortableGit/versions/1.2.0/cmd:\
 | **「开始帮我添加微信」** / 加微信好友 / 继续加微信 | 走**阶段B** → `wechat_add.py run --limit 10` |
 | **「登记到飞书」** / 同步到飞书表格 | 走**阶段C** → `feishu_sync.py` |
 | 提到「同步」「好友改了规则」「拉一下最新」 | 走**第 4 节 多人协作** |
+| 🔴 **「暂停任务」** | **立即暂停一切**（2026-09-23 用户定）：停当前阶段、`Stop-Process` 按 **PID** 杀 `run_b_to_target.py` / `wechat_add.py` / `collect_more.py` 及其子进程、`tools/kill_auto_edge.py` 清自动化 Edge、`WM_CLOSE` 关遗留「申请添加朋友」窗口；**不再启动新阶段**（不接着跑 C）；汇报当前进度（今日已发 N/M、剩余待加）后停手，等用户再说继续 |
+
+## 1.1 ⭐ 「置顶任务」的默认行为（2026-09-23 用户定）
+
+用户说「**开始置顶任务**」= A→B→C 全链路，目标是「**添加到当日 50 个微信好友申请为止**」。
+（当日基线 = **今天第一次开跑 B 时**台账 `sent` 总数，用 `tools/run_b_to_target.py --target 50` 按差额算 limit。）
+
+🔴 **`--baseline` 陷阱（2026-09-23 实测，会造成超发）**：脚本**不会**自动识别「今天已发多少」——
+不传 `--baseline` 时它把**当前** `sent` 总数当基线 ⇒ 「今日已发」被重算成 **0** ⇒ 会**再发最多 50 个**。
+- 今日**首次**开跑 B：直接 `"$PY" tools/run_b_to_target.py --target 50`（此刻当前 sent 就是今日基线，数学上恰好正确）。
+- **中途续跑/补跑**（今天已经发过一部分）：必须显式传
+  `"$PY" tools/run_b_to_target.py --target 50 --baseline <今日基线>`。
+  基线 = 当前 sent 总数 − 今日已发；拿不准就先 `--dry` 看它打印的「当前 sent」，或从当天日志里
+  找 B 第一次开跑时的 sent 总数（例：今日 290 起跑、当前 sent=330 ⇒ 今日已发 40 ⇒ 还差 10）。
+
+**两条铁律级分支（用户在 2026-09-23 追加）**
+
+1. 🔴 **A 阶段一撞限流就切 B**：A 出现 `11001` 或 `list_truncated` ⇒ **不要再等限流窗口**，
+   立即停 A → `tools/merge_into_darens.py --from out/collect/darens_more<N>.json --only-with-contact`
+   把**已经跑完那一轮**的产物并进 `darens.json`（⚠️ `collect_more.py` **只在全部轮次结束时
+   才合并**，中途被杀 = 最后一轮白跑；已跑完轮次的 `darens_more<N>.json` 仍可用）→ 转 B。
+2. 🔴 **暂停优先于一切**：见上表「暂停任务」。**先停进程，再汇报**，别先跑收尾 C。
+
+**顺序**：A、B **严禁并行**（B 靠桌面截图，A 会把 Edge 拉到最前 → B 误判 `risk_control`/`not_found`）；
+B 跑完再跑 C。
 
 > **阶段C 是「跑完 A 及 B 后各跑一次」的固定收尾**（用户 2026-09-17 定）：
 > A 跑完先登记一遍，B 跑完再跑一遍更新「状态」列。脚本幂等，重复跑不会产生重复行。
@@ -568,6 +594,17 @@ B 拍到 Edge → 误判 `risk_control` 整轮中止 / `not_found` 永久跳过�
 3. 涉及个人目录的批量操作，一律先扫描、备份、再确认。
 4. 清理残留 Edge 时只按**命令行包含 `.edge-auto\profile`** 精确匹配，
    绝不碰用户自己的 Edge。
+   🔴 **2026-09-23 实测：这条以前只是"写在纸上"，代码是反的。** `tools/kill_edge.sh`
+   与 `tools/collect_more.py::kill_edge()` 都是 `taskkill /F /IM msedge.exe /T`，
+   而当时本机 **14 个 msedge 全是用户自己的**（`edge-auto` 归属 **0 个**）——
+   等于**每轮采集都把用户的浏览器群灭一次**。现已统一收敛到
+   `tools/kill_auto_edge.py`（唯一实现）。改动前先 `--list` 自检：
+   ```
+   "$PY" tools/kill_auto_edge.py --list
+   # 自动化(edge-auto) msedge PID: []      ← 正常（没有残留）
+   # 全部 msedge 数: 14                    ← 这些是用户的，谁都不许杀
+   ```
+   ⚠️ `tasklist` **看不到命令行**，所以判据只能走 `Win32_Process.CommandLine`。
 
 ## 6. 排错索引（详见 `RUNBOOK.md`）
 

@@ -359,6 +359,30 @@ CONTACT_FIELD = "has_contact"        # 平台侧「有联系方式」在 payload
 CONTACT_LABEL = os.environ.get("CONTACT_LABEL", "有联系方式")
 PLATFORM_CONTACT_FILTER = os.environ.get(
     "PLATFORM_CONTACT_FILTER", "1").lower() not in ("0", "false", "no", "off", "")
+
+# 【遮罩跳过】2026-09-23 用户截图要求（原话：「图中情况跳过」）
+#  达人详情页的联系方式行显示为遮罩占位（如「达人微信号：……」），悬停提示
+#  「达人自主披露联系方式，你可点击小眼睛查看」——此时点小眼睛**揭不开**，
+#  原逻辑会：连点 3 轮 × 2 次（眼睛 + 复制图标）× 2 行 ≈ 25 秒，最后仍拿不到值。
+#  ⇒ 命中遮罩态直接**跳过该达人**（不点图标、不退到手机号行），省掉这段空转。
+#  关掉：MASK_SKIP=0
+MASK_SKIP = os.environ.get(
+    "MASK_SKIP", "1").lower() not in ("0", "false", "no", "off", "")
+
+
+def is_masked_value(v):
+    """联系方式值位是不是**遮罩占位**（「……」「***」「•••」等）。
+
+    纯函数、单机可测。注意 `valid()` 已经拒绝带 `*` 的值，这里额外识别
+    省略号/圆点这类**不含星号**的掩码，避免点一轮空的小眼睛。
+    """
+    v = (v or "").strip()
+    if not v:
+        return False
+    core = v
+    for ch in ("…", "•", "*", ".", "·", " "):
+        core = core.replace(ch, "")
+    return (not core) or ("*" in v) or ("…" in v) or ("•" in v)
 CATE_FIELD = "main_cate_new"
 # 子类目落在另一个字段上（2026-09-22 探针实测）：
 #   选「个护家清 > 个人护理」-> payload 同时带
@@ -2681,10 +2705,20 @@ def main():
                         v = (v or "").strip()
                         return bool(v) and len(v) >= 3 and len(v) <= 40 and "*" not in v
 
+                    mask_skip = False
                     for kw, ctype in (("达人微信号", "微信"), ("达人手机号", "手机")):
                         row = next((x for x in scan["rows"] if kw in x["text"]), None)
                         if not row:
                             continue
+                        # 🔴 遮罩态（「达人微信号：……」+ 悬停提示「你可点击小眼睛查看」）
+                        #    -> 按用户要求**跳过该达人**：不点小眼睛、也不退到手机号行。
+                        cur_val = row["text"].split("：")[-1] if "：" in row["text"] else ""
+                        if MASK_SKIP and is_masked_value(cur_val):
+                            log("   [%d/%d] %-20s 「%s」为遮罩态(需点小眼睛揭开) -> 跳过该达人"
+                                % (i, cand_n, (r["nickname"] or "")[:18], kw))
+                            r["skip_reason"] = "联系方式遮罩未披露·跳过"
+                            mask_skip = True
+                            break
                         icon = wechat_icon(scan, kw)
                         if not icon:
                             log("   [%d/%d] %s 有「%s」行但没找到眼睛图标" % (
@@ -2715,7 +2749,7 @@ def main():
                             icon = icon2
                         if got_val:
                             break
-                    if got_val:
+                    if got_val or mask_skip:
                         break
                     no_row = not any(kw in x["text"] for x in scan["rows"]
                                      for kw in ("达人微信号", "达人手机号"))

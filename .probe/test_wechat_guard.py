@@ -88,7 +88,41 @@ st, at = run_seq(["FROZEN"] * 8)
 check("复现冻结帧场景 -> 第 3 张就拦住", at, 2)
 
 print()
+print("multi_frame_frozen() 单测（2026-09-23 新增：2 帧交替绕过 freeze_step）：")
+
+# 7) 复现 09-23 真实场景：10 个不同微信号，结果图只有 2 种指纹
+mf = [None] * 11
+for idx in range(1, 11):
+    seen = {"A"} if idx in (1, 3, 4, 7, 8, 10) else {"A", "B"}
+    mf[idx] = W.multi_frame_frozen(idx, seen)
+check("2 帧交替 -> 第 5 个起拦住", mf[5], True)
+check("2 帧交替 -> 前 4 个不拦", [mf[1], mf[2], mf[3], mf[4]], [False] * 4)
+
+# 8) 单帧（全部相同）也拦
+check("单一指纹 -> 拦住", W.multi_frame_frozen(5, {"A"}), True)
+
+# 9) 正常轮次（每种不同）绝不误伤
+check("10 种指纹 -> 不拦", W.multi_frame_frozen(10, {"m%d" % i for i in range(10)}), False)
+check("3 种指纹 -> 不拦", W.multi_frame_frozen(10, {"A", "B", "C"}), False)
+check("只跑到第 4 个 -> 不拦", W.multi_frame_frozen(4, {"A"}), False)
+
+print()
+print("搜索框定位 / 新状态 单测：")
+
+# 10) norm_text：OCR 会丢下划线/点，比对前先归一化
+check("norm_text 基本", W.norm_text("gaoyan6665"), "gaoyan6665")
+check("norm_text 去符号", W.norm_text("wxid_9okb86cj3e9r12"), "wxid9okb86cj3e9r12")
+check("norm_text 不同号不误判", W.norm_text("LYW00736") in W.norm_text("18"), False)
+
+# 11) 搜索结果页里「搜不到」不能吃掉「账号状态异常」
+check("ABNORMAL_KW 非空", bool(W.ABNORMAL_KW), True)
+check("abnormal 计入已完成(跳过)",
+      "abnormal" in W.DONE_STATUS, True)
+check("abnormal 有中文标签", W.STATUS_LABEL.get("abnormal"), "账号状态异常(跳过)")
+check("标题不会被当成搜索框", "添加朋友" in W.WeChat.BOX_LABELS, True)
+
+print()
 if FAIL:
     print("!! 失败 %d 项：%s" % (len(FAIL), " / ".join(FAIL)))
     sys.exit(1)
-print("全部通过（%d 项）" % 11)
+print("全部通过（%d 项）" % 26)

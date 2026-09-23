@@ -70,7 +70,7 @@ def known_contacts():
 
 
 def kill_edge():
-    """杀掉残留的 msedge，等它归零。
+    """杀掉**自动化残留**的 msedge（命令行含 `.edge-auto`），等它归零。
 
     为什么每轮都要做（2026-09-19 血泪）：
       Playwright 用 launch_persistent_context 启的 msedge，在 python 被强杀后
@@ -79,25 +79,29 @@ def kill_edge():
         TargetClosedError + 「正在现有浏览器会话中打开」
       现象是「退出码 1 / 耗时 0.0 分 / 日志空白」，极易被误判成平台限流 11001。
 
-    两个必须记住的点：
+    三个必须记住的点：
+      * 🔴 **只杀命令行含 `.edge-auto` 的 PID**（安全铁律 #4）—— 别用 `/IM msedge.exe`，
+        那会连**用户自己的 Edge** 一起杀（2026-09-23 实测：本机 14 个 msedge 全是
+        用户自己的、自动化残留 0 个，旧代码等于每轮群灭一次用户的浏览器）。
       * taskkill/tasklist 必须用**单斜杠**；写 `//F` 会被当成无效参数而静默失败。
       * 杀完要**立刻**启动，不能等 —— 实测约 15 秒后 Edge 会自己带会话重启，
         又占住 profile。所以这里只轮询到归零（约 1-3 秒）就返回。
+
+    实现收敛在 `tools/kill_auto_edge.py`（bash 侧的 tools/kill_edge.sh 也调它），
+    避免「两处实现漂移」——本函数只做转调 + 兜底。
     """
-    try:
-        subprocess.run(["taskkill", "/F", "/IM", "msedge.exe", "/T"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-    for _ in range(20):
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "kill_auto_edge.py")
+    if os.path.exists(helper):
         try:
-            out = subprocess.run(["tasklist", "/fi", "imagename eq msedge.exe"],
-                                 capture_output=True).stdout.decode("gbk", "replace")
+            subprocess.run([sys.executable, helper],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=180)
+            return
         except Exception:
-            break
-        if out.count("MsEdge.exe") == 0:
-            break
-        time.sleep(0.5)
+            pass
+    # 兜底：helper 不可用时至少不要杀到用户自己的 Edge
+    print("[kill_edge] ⚠️ 未找到 tools/kill_auto_edge.py，跳过清理（宁可不清理，也不误杀用户 Edge）")
 
 
 def run_pass(idx, target_daren):
