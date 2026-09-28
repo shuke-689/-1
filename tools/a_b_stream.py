@@ -27,11 +27,17 @@
    撞一次 11001 还要额外退避 90 秒（09-28 实测节奏 131 秒/人）。
    ⇒ 想真正压到接近 15 秒/人，加 `SKIP_DOUYIN_ID=1`（代价：飞书「抖音号」列留空）。
 
-停止条件（任一命中即停，绝不"重跑试运气"）：
-  · 当天备选配额达成（个护 + 美妆 都到 40）；
-  · A 本轮 0 新微信号 且日志成片「遮罩」⇒ ⚠️ **先查 `MASK_SKIP`，不是账号限权**（RUNBOOK §429 已两次证伪）→ 停并给复核命令；
-  · 连续 3 轮 0 新微信号（非遮罩）⇒ 停；
+停止条件：
+  · 当天各类目配额都达成；
+  · 某个类目连续 2 轮 0 新微信号（且**无**限流截断标记）⇒ 判**该类目淘空** → **换下一个类目继续**；
+  · 连续 3 轮命中限流截断标记 ⇒ 收工（不等限流窗口）；
+  · 全部类目都淘空 ⇒ 收工（会提示换更宽的子类目）；
   · 达到 `--max-rounds`。
+
+🔴 **别把「限流截断」当「淘空」**（09-28 实测踩到）：`collect.py` 的截断护栏会把
+   「连续 15 屏无新增且接口仅 2 条」判为限流 → **不产出名单** + 写 `out/collect/ratelimit<tag>.txt`。
+   现象与"类目淘空"一模一样（都是 0 条），但处置相反：限流要停手，淘空要换类目。
+   本脚本按该标记区分，并且**每轮开始会清掉旧标记**（否则上一轮的标记会被误读）。
 
 用法：
   python tools/a_b_stream.py --dry                 # 只看现状与配置
@@ -182,6 +188,11 @@ def run_a(k, target, cate_parent, cate_child, interval):
     lp = os.path.join(BASE, "out", "collect%s.log" % tag)
     if os.path.exists(lp):
         os.remove(lp)
+    # ⚠️ 必须清掉**旧的限流标记**：本脚本每跑一次 k 都从 1 开始，
+    #    上一次运行留下的 ratelimit_s2.txt 会被误当成"本轮限流"（分类就错了）。
+    rmp = os.path.join(OUT, "ratelimit%s.txt" % tag)
+    if os.path.exists(rmp):
+        os.remove(rmp)
 
     t0 = time.time()
     with open(lp, "a", encoding="utf-8", errors="replace") as fh:
@@ -292,13 +303,28 @@ def main():
         return
 
     rounds_without_new = 0
+    rate_streak = 0                 # 连续命中「列表截断」的轮数（平台限流）
+    empty_streak = {}               # key -> 该类目连续空转轮数（淘空判定）
+    rate_hits_cat = {}              # key -> 本轮运行中该类目命中限流的次数（用于换类目轮换）
+    EXHAUST_AT = 2                  # 某类目连续 2 轮 0 新号 -> 判淘空，换下一个类目
+    RATE_STOP_AT = 3                # 连续 3 轮限流 -> 收工（别耗在限流窗口上）
     for k in range(1, args.max_rounds + 1):
-        # ---- 选类目：挑「配额缺口最大」的；都达标就收工 ----
-        todo_cats = [(p, c, n, key) for p, c, n, key in quotas if st["done"].get(key, 0) < n]
+        # ---- 选类目：只在「配额未满 且 未判淘空」的类目里挑缺口最大的 ----
+        todo_cats = [(p, c, n, key) for p, c, n, key in quotas
+                     if st["done"].get(key, 0) < n and empty_streak.get(key, 0) < EXHAUST_AT]
         if not todo_cats:
-            log("当天备选配额已全部达成 -> 收工")
+            left = [(key, st["done"].get(key, 0), n) for p, c, n, key in quotas
+                    if st["done"].get(key, 0) < n]
+            if left:
+                log("所有类目都已淘空（还没到配额）：%s"
+                    % " / ".join("%s %d/%d" % (x, a, b) for x, a, b in left))
+                log("-> 建议换个更宽的子类目（如 个护家清>不限）或改天再采；收工")
+            else:
+                log("当天备选配额已全部达成 -> 收工")
             break
-        todo_cats.sort(key=lambda x: -(x[2] - st["done"].get(x[3], 0)))
+        # 先按「本轮该类目被限流次数」升序（避开刚被限流的类目）、再按缺口降序
+        todo_cats.sort(key=lambda x: (rate_hits_cat.get(x[3], 0),
+                                      -(x[2] - st["done"].get(x[3], 0))))
         p, c, quota_n, key = todo_cats[0]
         need = quota_n - st["done"].get(key, 0)
         # 本轮目标：不超过 chunk（因为攒够 chunk 个微信号就要跑 B），也不超过该类目缺口
@@ -312,20 +338,39 @@ def main():
 
         if not fresh:
             hits = mask_hits(lp)
+            # 🔴 先分清「平台限流截断」还是「这个类目真淘空了」—— 09-28 实测踩过：
+            #    截断护栏命中时 collect.py 会写 ratelimit<tag>.txt 并且**不产出名单**，
+            #    现象与"淘空"一样（都是 0 条），但处置完全不同（限流要停手，淘空要换类目）。
+            rl_mark = os.path.exists(os.path.join(OUT, "ratelimit_s%d.txt" % k))
+            if rl_mark:
+                rate_streak += 1
+                rate_hits_cat[key] = rate_hits_cat.get(key, 0) + 1
+                log("  !! 本轮命中**列表截断护栏**（out/collect/ratelimit_s%d.txt）"
+                    "-> 平台限流，本批不产出（注意：**不是**候选池淘空）" % k)
+                log("     按铁律**不等限流窗口**；连续 %d/%d 轮限流" % (rate_streak, RATE_STOP_AT))
+                if rate_streak >= RATE_STOP_AT:
+                    log("  !! 连续 %d 轮被限流 -> 收工（改天或等限流过去再跑，状态会接着算）" % rate_streak)
+                    break
+                log("  -> 换下一个类目试（不同类目的列表请求可能不受同一波限流影响）")
+                continue
+            rate_streak = 0
+            empty_streak[key] = empty_streak.get(key, 0) + 1
             rounds_without_new += 1
-            log("  !! 本轮**新微信号 0 个**（产出 %d 条；日志「遮罩」%d 次；连续空转 %d 轮）"
-                % (len(recs), hits, rounds_without_new))
+            log("  !! 本轮**新微信号 0 个**（产出 %d 条；无截断标记 => 判**该类目淘空**；"
+                "日志「遮罩」%d 次；该类目连续空转 %d/%d）"
+                % (len(recs), hits, empty_streak[key], EXHAUST_AT))
             if hits >= 3:
                 log("  !! 日志成片「遮罩」-> **先查 MASK_SKIP，别急着判账号限权**（09-28 已两次证伪）：")
                 log("     小样本复核：MASK_SKIP=0 TARGET_DAREN=6 OUT_TAG=_probe MAX_SCROLL=60 \"$PY\" collect.py")
                 log("     · 出现「联系=微信」= 一切正常，直接重跑本脚本（状态会接着算）")
                 log("     · 仍取不到值 -> 看日志「有「达人微信号」行但没找到眼睛图标」= wechat_icon 定位坏了")
                 break
-            if rounds_without_new >= 3:
-                log("  !! 连续 3 轮没捞到新微信号 -> 收工（可能是候选池已淘空）")
-                break
+            if empty_streak[key] >= EXHAUST_AT:
+                log("  -> 类目 %s **判为淘空**（%d 轮 0 新号）-> 换下一个类目继续" % (key, EXHAUST_AT))
             continue
         rounds_without_new = 0
+        rate_streak = 0
+        empty_streak[key] = 0
 
         log("  A 本轮出**新微信号 %d 个**%s" % (
             len(fresh), "（达本轮目标）" if len(fresh) >= target else "（不足目标 %d）" % target))
