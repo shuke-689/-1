@@ -119,6 +119,15 @@ MAX_SCROLL = int(os.environ.get("MAX_SCROLL", "16"))         # 每轮最多翻�
 DUMP_APIS = os.environ.get("DUMP_APIS", "") not in ("", "0", "false", "False")
 # 请求降速 / 限流退避（抖音精选联盟 square_pc_api 过密会返回 11001 请求过于频繁）
 DAREN_PAUSE = float(os.environ.get("DAREN_PAUSE", "2.0"))      # 每个达人主页之间的间隔秒
+# 【达人节流】2026-09-28 用户要求「筛选频次 15S 一次」
+#   语义：**与上一个达人开始处理的时刻至少间隔 N 秒**（下限节流，不足则补 sleep）。
+#   ⚠️ 这是"排队下限"，不是"提速目标"：实测单个达人（开主页 + 带货分析 + 抓微信号）
+#      在**不撞限流**时约 40 秒，其中「达人抖音主页」抓抖音号就占 ~30 秒。
+#      要真正压到 15 秒/人 得配 `SKIP_DOUYIN_ID=1`（代价：飞书那列抖音号留空）。
+#      撞上 11001 时每次还要额外退避 RATE_BACKOFF 秒，届时秒/人 = 40 + 90。
+DAREN_MIN_INTERVAL = float(os.environ.get("DAREN_MIN_INTERVAL", "0"))
+# 【跳过抖音号抓取】每个达人省 ~30 秒（回填飞书「抖音号」列用；跳过则该列留空）
+SKIP_DOUYIN_ID = os.environ.get("SKIP_DOUYIN_ID", "") not in ("", "0", "false", "False")
 RATE_BACKOFF = int(os.environ.get("RATE_BACKOFF", "90"))       # 命中限流后的退避秒数
 SCROLL_PAUSE = float(os.environ.get("SCROLL_PAUSE", "2.8"))    # 每屏滚动后的等待秒
 # 【列表截断护栏】列表接口只回很少几条就再也滚不动时，视为**被限流截断**：
@@ -360,14 +369,20 @@ CONTACT_LABEL = os.environ.get("CONTACT_LABEL", "有联系方式")
 PLATFORM_CONTACT_FILTER = os.environ.get(
     "PLATFORM_CONTACT_FILTER", "1").lower() not in ("0", "false", "no", "off", "")
 
-# 【遮罩跳过】2026-09-23 用户截图要求（原话：「图中情况跳过」）
-#  达人详情页的联系方式行显示为遮罩占位（如「达人微信号：……」），悬停提示
-#  「达人自主披露联系方式，你可点击小眼睛查看」——此时点小眼睛**揭不开**，
-#  原逻辑会：连点 3 轮 × 2 次（眼睛 + 复制图标）× 2 行 ≈ 25 秒，最后仍拿不到值。
-#  ⇒ 命中遮罩态直接**跳过该达人**（不点图标、不退到手机号行），省掉这段空转。
-#  关掉：MASK_SKIP=0
+# 【遮罩跳过】2026-09-23 上线，**2026-09-28 实测证伪、默认值反转**
+#  背景：达人详情页的联系方式行有时显示成占位（如「达人微信号：……」），悬停提示
+#  「达人自主披露联系方式，你可点击小眼睛查看」。09-23 依据一张截图（用户原话
+#  「图中情况跳过」）判定「点小眼睛也揭不开」，于是加了这条**整批跳过**。
+#  🔴 2026-09-28 实测证伪（同一账号、同一天、相隔 10 分钟的对照）：
+#     · 10:24 那轮（MASK_SKIP=1）：达人在「遮罩态」被跳过 → 本轮 0 有效；
+#     · 10:34 起（MASK_SKIP=0）：**同一个达人**点小眼睛后正常拿到微信号。
+#     · 14:29 复核（12 候选）：有效 8/9、微信号 6、遮罩 0、11001 0。
+#   即：占位态只是**未揭开**，点小眼睛是**能揭开**的。MASK_SKIP=1 会把几乎
+#    100% 的微信号静默丢掉（09-24「账号降权」、09-28 下午「账号限权」两次误判都源于此）。
+#  ⇒ 默认改为 **0（不跳过、照常点小眼睛）**。只有确认某个账号的确点不开时才用
+#    `MASK_SKIP=1` 临时省时间。
 MASK_SKIP = os.environ.get(
-    "MASK_SKIP", "1").lower() not in ("0", "false", "no", "off", "")
+    "MASK_SKIP", "0").lower() not in ("0", "false", "no", "off", "")
 
 
 def is_masked_value(v):
@@ -2491,6 +2506,9 @@ def main():
         # ---------- 逐个取联系方式（取满 TARGET_DAREN 个有效达人就停） ----------
         log("=" * 66)
         log("逐个打开达人主页取联系方式（目标：%d 个有效达人）" % TARGET_DAREN)
+        log("  节奏：达人间隔 %.1f 秒起（DAREN_MIN_INTERVAL）%s；命中限流退避 %d 秒" % (
+            DAREN_MIN_INTERVAL, "；**已跳过抖音号抓取**" if SKIP_DOUYIN_ID else "",
+            RATE_BACKOFF))
         done = []                   # 已处理的达人（含被跳过/取不到的）
         verdict_cache = {}          # uid -> "skip"/"go"，重试时不重复判带货
         valid_n = 0                 # 已取到联系方式的「有效达人」数
@@ -2530,10 +2548,18 @@ def main():
                     time.sleep(6)
             return False
 
+        _t_daren_start = 0.0
         for i, r in enumerate(picked, 1):
             if valid_n >= TARGET_DAREN:
                 log("  已取满 %d 个有效达人 -> 停止筛选，准备进入下一步" % TARGET_DAREN)
                 break
+            # 【达人节流】与上一个达人**开始处理**的时刻至少间隔 DAREN_MIN_INTERVAL 秒
+            #   （用户 09-28「筛选频次 15S 一次」；下限节流，不足才补睡，不拖慢正常节奏）
+            if DAREN_MIN_INTERVAL > 0 and _t_daren_start:
+                _gap = DAREN_MIN_INTERVAL - (time.time() - _t_daren_start)
+                if _gap > 0:
+                    time.sleep(_gap)
+            _t_daren_start = time.time()
             # 限流退避：达人详情 / 带货分析 接口返回 11001 时先歇一会儿再继续
             if rl["hit"]:
                 log("  ~~ 检测到平台限流（%s %s），退避 %d 秒…" % (
@@ -2776,7 +2802,7 @@ def main():
             # 【登记飞书用】取达人抖音号：点「达人抖音主页」→ 读抖音主页上的「抖音号」
             #   只对**取到联系方式的**达人取（省时间；没联系方式的也不会登记）
             #   ⚠️ 内部有防串号校验（点击前先确认主页是本人），失败返回空串，绝不写可疑值
-            if got_val and not r.get("douyin_id"):
+            if got_val and not r.get("douyin_id") and not SKIP_DOUYIN_ID:
                 try:
                     r["douyin_id"], r["douyin_nick"] = DID.fetch(
                         page, ctx, r["nickname"], log=log)
