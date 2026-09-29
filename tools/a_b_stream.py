@@ -31,6 +31,8 @@
   · 当天各类目配额都达成；
   · 某个类目连续 2 轮 0 新微信号（且**无**限流截断标记）⇒ 判**该类目淘空** → **换下一个类目继续**；
   · 连续 3 轮命中限流截断标记 ⇒ 收工（不等限流窗口）；
+  · 连续 3 轮 A **退出码 1**（运行异常，绝大多数是自动化 Edge 残留占锁）⇒ 收工；
+  · A **退出码 3**（登录失效）⇒ 立即中止；
   · 全部类目都淘空 ⇒ 收工（会提示换更宽的子类目）；
   · 达到 `--max-rounds`。
 
@@ -183,16 +185,20 @@ def run_a(k, target, cate_parent, cate_child, interval):
         "SKIP_DOUYIN_ID": os.environ.get("SKIP_DOUYIN_ID", "0"),
     })
     jp = os.path.join(OUT, "darens%s.json" % tag)
-    if os.path.exists(jp):
-        os.remove(jp)
     lp = os.path.join(BASE, "out", "collect%s.log" % tag)
-    if os.path.exists(lp):
-        os.remove(lp)
     # ⚠️ 必须清掉**旧的限流标记**：本脚本每跑一次 k 都从 1 开始，
     #    上一次运行留下的 ratelimit_s2.txt 会被误当成"本轮限流"（分类就错了）。
     rmp = os.path.join(OUT, "ratelimit%s.txt" % tag)
-    if os.path.exists(rmp):
-        os.remove(rmp)
+    # 🔴 删旧文件必须**容忍失败**：Windows 上偶发 WinError 32（别的进程/杀软刚碰过），
+    #    09-29 实测因此**整条流水线崩掉**（PermissionError: out\collect_s2.log 正在使用）。
+    #    删不掉也无所谓 —— 后面 open(...,"a") 是追加写，不影响本轮结果。
+    for _p in (jp, lp, rmp):
+        try:
+            if os.path.exists(_p):
+                os.remove(_p)
+        except OSError as e:
+            log("  ⚠️ 清旧文件失败（忽略，继续跑）：%s（%s）"
+                % (os.path.basename(_p), e))
 
     t0 = time.time()
     with open(lp, "a", encoding="utf-8", errors="replace") as fh:
@@ -304,6 +310,7 @@ def main():
 
     rounds_without_new = 0
     rate_streak = 0                 # 连续命中「列表截断」的轮数（平台限流）
+    crash_streak = 0                # 连续 A 运行异常（退出码 1，多为 Edge 残留占锁）的轮数
     empty_streak = {}               # key -> 该类目连续空转轮数（淘空判定）
     rate_hits_cat = {}              # key -> 本轮运行中该类目命中限流的次数（用于换类目轮换）
     EXHAUST_AT = 2                  # 某类目连续 2 轮 0 新号 -> 判淘空，换下一个类目
@@ -338,6 +345,25 @@ def main():
 
         if not fresh:
             hits = mask_hits(lp)
+            # ⓪ 运行异常（退出码 1）—— 09-29 实测：退出码 1 的绝大多数是**自动化 Edge 残留占锁**
+            #    （现象：耗时 0.0 分 / 日志里只有 playwright 的 close 记录 / TargetClosedError
+            #      +「正在现有浏览器会话中打开」；见 RUNBOOK §1.5）。
+            #    🔴 绝不能当成「类目淘空」：exit 1 是**崩溃**，不是没数据 ——
+            #       当淘空会白白换类目、还把配额判成满不了。这里改成清 Edge 重试。
+            if rc == 1:
+                crash_streak += 1
+                log("  !! A 退出码 1 = 运行异常（最常见：自动化 Edge 残留占锁，见 RUNBOOK §1.5）"
+                    "；连续 %d/3 轮" % crash_streak)
+                if crash_streak >= 3:
+                    log("  !! 连续 3 轮运行异常 -> 收工（先手动确认 Edge 与登录态，别硬耗）")
+                    break
+                log("  -> 重新清 Edge 后重试本类目")
+                time.sleep(5)
+                continue
+            if rc == 3:
+                log("  !! 退出码 3 = 登录失效 -> 整体中止（去 Edge 窗口登录后重跑本脚本）")
+                break
+            crash_streak = 0
             # 🔴 先分清「平台限流截断」还是「这个类目真淘空了」—— 09-28 实测踩过：
             #    截断护栏命中时 collect.py 会写 ratelimit<tag>.txt 并且**不产出名单**，
             #    现象与"淘空"一样（都是 0 条），但处置完全不同（限流要停手，淘空要换类目）。
@@ -370,6 +396,7 @@ def main():
             continue
         rounds_without_new = 0
         rate_streak = 0
+        crash_streak = 0
         empty_streak[key] = 0
 
         log("  A 本轮出**新微信号 %d 个**%s" % (
