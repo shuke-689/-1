@@ -442,4 +442,20 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("!! 收到中断（Ctrl+C / 被杀）-> 退出")
+        raise
+    except Exception:
+        # 🔴 09-29 教训：本脚本曾以退出码 1 **无声退出**（日志里连 traceback 都没有，
+        #    只剩下一轮开头），排查全靠猜。这里强制把堆栈落进日志，别再"静默死亡"。
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            log("!! a_b_stream 异常退出（退出码 1）：\n%s" % tb)
+        except Exception:
+            pass
+        sys.stderr.write("!! a_b_stream 异常退出（退出码 1）：\n%s\n" % tb)
+        sys.stderr.flush()
+        raise
