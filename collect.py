@@ -34,7 +34,9 @@
           可关：LOCAL_SETTLE_FILTER=0
   粉丝量 = 10w以下（⚠️ 2026-09-22 已从平台侧移除，改由本地**规则2d** 兜底）
   有联系方式 = 勾选（2026-09-22 晚**加回**；不加则每个候选都要开主页，微信率 13% -> 48%~57%）
-  ⚠️ 平台侧现行共四项：主推类目(级联) + 内容类型(13项) + 直播结算总额 + 有联系方式。
+  ⚠️ 平台侧现行共三项：主推类目(级联) + 直播结算总额 + 有联系方式。
+     **2026-09-29 用户新规则：内容类型筛选条件剔除**（默认不再勾选该筛选项；
+     要恢复：export PLATFORM_CT_FILTER=1）。本地规则6（内容类型白/黑名单）**仍然生效**。
      口径的**唯一权威版本在 RUNBOOK.md §1.6**，本文件 docstring 只写要点。
 本地过滤：
   性别 = 女(gender==2)
@@ -336,9 +338,10 @@ SALE_FIELD_BY_LABEL = {
     "橱窗结算总额": "common_range_selection_window_sales_30d_settle",
 }
 # ===========================================================================
-# 【平台侧筛选】现行口径 —— 2026-09-22 晚：**平台侧共四项**
+# 【平台侧筛选】现行口径 —— 2026-09-29 起：**平台侧共三项**（内容类型已剔除）
 #   ① 主推类目   —— 级联：个护家清 > 个人护理 ／ 美妆 > 不限
-#   ② 内容类型   —— 先在 form-item 右侧点「展开」，再点选 13 个 chip
+#   ② 内容类型   —— ❌ **2026-09-29 用户规则：筛选条件剔除**（默认不勾选；PLATFORM_CT_FILTER=0）
+#                    恢复原行为：export PLATFORM_CT_FILTER=1（先点「展开」再点选 13 个 chip）
 #   ③ 直播结算总额 = 1w-10w
 #   ④ 有联系方式 —— 开关型 form-item，点一下就勾上（2026-09-22 晚用户要求**加回**）
 #
@@ -419,6 +422,17 @@ CONTENT_TYPES = tuple(x.strip() for x in os.environ.get(
     "CONTENT_TYPES",
     "亲子,休闲娱乐,剧情,情感,时尚,明星,母婴,生活记录,舞蹈,艺术,音乐,颜值,其他",
 ).split(",") if x.strip())
+
+# 【内容类型 · 平台侧开关】2026-09-29 用户新规则：「内容类型筛选条件剔除」。
+#   ⇒ **默认不在平台侧勾选内容类型**（PLATFORM_CT_FILTER 默认 "0" = 剔除）。
+#   保留 CONTENT_TYPES 常量与 apply_content_types() 实现，要恢复 13 项勾选：
+#     export PLATFORM_CT_FILTER=1
+#   ⚠️ 只影响**平台侧**。本地【规则6】（CONTENT_KEEP 白名单 + CONTENT_EXCLUDE 黑名单）
+#      **照旧生效** —— 平台侧不筛只是把候选面放大，最终名单仍由规则6 把关。
+#   ⚠️ 剔除后 `_filt_bad()` 的 payload 硬校验从「三项」变「两项」（结算额 + 主推类目），
+#      不再要求 payload 里出现 content_type。
+PLATFORM_CT_FILTER = os.environ.get(
+    "PLATFORM_CT_FILTER", "0").lower() not in ("0", "false", "no", "off", "")
 
 # 【已移除·2026-09-22】达人画像(达人性别=女) / 粉丝画像(粉丝性别=女性居多) 两项平台筛选
 #   —— 平台的 agg 类筛选项整体下架（同批下架的「粉丝量」后来也没回来；但
@@ -1675,7 +1689,8 @@ def main():
         def _filt_bad(filt):
             """检查一份 payload filters 是否满足当前全部筛选要求，返回问题列表。
 
-            2026-09-22 口径变更后**硬校验三项**：结算额 + 主推类目(含子类目) + 内容类型。
+            硬校验：结算额 + 主推类目(含子类目)。内容类型**仅在** PLATFORM_CT_FILTER=1 时校验
+            （2026-09-29 起平台侧默认**剔除**内容类型筛选，见文件上方常量）。
             「有联系方式」只做**软校验**（见下 ④）：失效只影响速度不影响名单正确性，
             所以只打一次日志提醒，**不**写进 bad（写进去会触发退出码 2 丢掉整批）。
             （粉丝量/达人画像/粉丝画像 已从平台侧整体移除，不再校验。）
@@ -1701,7 +1716,8 @@ def main():
                         bad.append("%s=%s(期望非空/子类目「%s」)"
                                    % (CATE_CHILD_FIELD, got_sub, CATE_CHILD))
             # ③ 内容类型：勾选项必须**逐项**都在 payload 里（平台回显即中文名）
-            if CONTENT_TYPES:
+            #    ⚠️ 2026-09-29 起平台侧默认**不筛**（PLATFORM_CT_FILTER=0）-> 跳过本项校验
+            if PLATFORM_CT_FILTER and CONTENT_TYPES:
                 got_ct = [str(x) for x in (filt.get(CONTENT_TYPE_FIELD) or [])]
                 miss = [c for c in CONTENT_TYPES if c not in got_ct]
                 if miss:
@@ -1810,7 +1826,12 @@ def main():
                探针实测：展开前后 DOM 里都是 42 个 chip，但只有展开后（64px 两行）才都点得到。
             ⚠️ chip 是 SPAN，选中态背景仍是 transparent -> **不能靠颜色判断选中**，
                命中情况一律交给后面的 payload 校验（_filt_bad）兜底。
+            ⚠️ 2026-09-29 起**默认整段跳过**（平台侧剔除内容类型筛选），见 PLATFORM_CT_FILTER。
             """
+            if not PLATFORM_CT_FILTER:
+                log("  [ct] **平台侧不筛内容类型**（PLATFORM_CT_FILTER=0，2026-09-29 新规则）"
+                    "-> 候选面放大，最终由本地规则6 把关")
+                return True
             if not CONTENT_TYPES:
                 return True
             if not page.evaluate(FIND_FORMITEM_JS, CONTENT_TYPE_LABEL):
@@ -2036,7 +2057,8 @@ def main():
             sys.exit(3)          # 退出码 3 = 一直没登录上（驱动层应整体中止）
         log("登录态正常：%s" % login_why)
 
-        # 🔴 2026-09-22 晚 平台侧**四项**：结算额 + 内容类型 + 主推类目(级联) + 有联系方式。
+        # 🔴 平台侧筛选：结算额 + 主推类目(级联) + 有联系方式
+        #    （2026-09-29 起**内容类型已剔除**；要恢复 export PLATFORM_CT_FILTER=1）
         #    其余（粉丝量/达人画像/粉丝画像）已整体移除，见文件上方常量注释。
         #
         # ① 直播结算总额 = 1w-10w
@@ -2047,7 +2069,8 @@ def main():
         for _opt in [o.strip() for o in SALE_OPTION.split("|") if o.strip()]:
             ok_sale = apply_formitem(SALE_LABEL, _opt, "sale") and ok_sale
 
-        # ② 内容类型（先点「展开」，再点选 13 项）
+        # ② 内容类型 —— **2026-09-29 起默认已剔除**（PLATFORM_CT_FILTER=0）；
+        #    =1 时恢复原行为（先点「展开」，再点选 13 项）
         ok_ct = apply_content_types()
 
         # ③ 主推类目级联：个护家清 > 个人护理 ／ 美妆 > 不限
@@ -2463,9 +2486,11 @@ def main():
                 continue
             seen.add(k)
             picked.append(r)
-        log("  筛选口径：平台侧 = 主推类目(%s>%s) + 内容类型(%d项) + %s(%s)；"
+        ct_desc = ("内容类型(%d项) + " % len(CONTENT_TYPES)) if PLATFORM_CT_FILTER \
+            else "内容类型**已剔除** + "
+        log("  筛选口径：平台侧 = 主推类目(%s>%s) + %s%s(%s)；"
             "本地规则4 = 主推类目必须命中 个护家清/美妆 其一"
-            % (CATE_PARENT, CATE_CHILD, len(CONTENT_TYPES), SALE_LABEL, SALE_OPTION))
+            % (CATE_PARENT, CATE_CHILD, ct_desc, SALE_LABEL, SALE_OPTION))
         log("  本地过滤：重复 %d / 非女性 %d / 敏感地区 %d / 非大陆 %d "
             "/ 粉丝超限 %d / 结算额不合格 %d / 无目标类目 %d "
             "/ 排除内容类型 %d / 昵称排除词 %d / 昵称品牌 %d -> 保留 %d" % (

@@ -118,7 +118,8 @@ def run_pass(idx, target_daren):
         "MAX_CANDIDATE": os.environ.get("MAX_CANDIDATE", "600"),
         "DAREN_PAUSE": os.environ.get("DAREN_PAUSE", "1.5"),
         "LOGIN_WAIT_SEC": os.environ.get("LOGIN_WAIT_SEC", "600"),
-        # 筛选口径透传（2026-09-22：平台侧固定 主推类目级联 + 内容类型 + 结算额；
+        # 筛选口径透传（平台侧 = 主推类目级联 + 结算额 + 有联系方式；
+        # 2026-09-29 起**内容类型已剔除**，要恢复 export PLATFORM_CT_FILTER=1；
         # 分支 Z / FILTER_PROFILE 已整体删除）
         "UNAUTH_LEVEL_MIN": os.environ.get("UNAUTH_LEVEL_MIN", "2"),
     })
@@ -158,10 +159,12 @@ def main():
         % (len(base_recs), len(base_uids), len(have)))
     log("目标：攒够 %d 个新的有微信联系方式的达人（最多 %d 轮，每轮 TARGET_DAREN=%d）"
         % (args.target, args.rounds, args.target_daren))
-    log("筛选口径：平台侧 = 主推类目(%s>%s) + 内容类型 + %s"
+    _ct = "内容类型 + " if os.environ.get("PLATFORM_CT_FILTER", "0").lower() not in (
+        "0", "false", "no", "off", "") else "内容类型**已剔除** + "
+    log("筛选口径：平台侧 = 主推类目(%s>%s) + %s%s"
         % (os.environ.get("CATE_PARENT", "个护家清"),
            os.environ.get("CATE_CHILD", "个人护理"),
-           os.environ.get("SALE_LABEL", "直播结算总额")))
+           _ct, os.environ.get("SALE_LABEL", "直播结算总额")))
     log("=" * 70)
     if args.dry:
         return

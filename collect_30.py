@@ -159,7 +159,8 @@ def run_batch(parent, child, tag, target):
             continue
         if limited:
             log("<<< %s 批重试 %d 次仍被限流，放弃该批" % (parent, MAX_RETRY))
-        # 退出码 2 = 筛选没生效（类目/内容类型/结算额任一，页面布局或渲染抖动）
+        # 退出码 2 = 筛选没生效（主推类目/结算额任一；内容类型 2026-09-29 起已剔除；
+        #   也可能是页面布局或渲染抖动）
         #   -> 短冷却重试
         if rc == 2 and attempt <= MAX_RETRY:
             log("<<< %s 批：筛选未生效（退出码 2）-> 冷却 %d 秒后重试（第 %d/%d 次）" % (
