@@ -654,6 +654,8 @@ B 拍到 Edge → 误判 `risk_control` 整轮中止 / `not_found` 永久跳过�
 | **飞书表里「结算总额 / 直播结算总额」= `0-0`** | **平台侧筛选不严格**（`[verify]` 通过但 156 条漏出 16 条）。`0-0` 是真实源数据（取不到值会显示**空串**而不是 0-0）。已加**规则2b** 本地兜底；回查历史遗留跑 `"$PY" feishu_audit.py` |
 | 名单里混进粉丝 >10w 的大号 | **规则2d 本地粉丝量兜底**（`fans_ok()`，默认开，上限 `FANS_MAX=100000`）。起因：① 平台把「粉丝量」改名「粉丝指数」；② **2026-09-22 起平台侧该项被整体移除**，本地成了唯一防线（`bad_fans()` 只是抽样计数、不拦数据）。日志看「规则2d 粉丝量兜底」+「粉丝量被剔除样本」 |
 | 日志「去重后 N 个达人」后紧跟「直播结算总额不在1w-10w M 个」 | 这行是**平台漏出的计数**（`bad_settle()` 只统计不拦数据），后面还会有「本地过滤：… 结算额不合格 K」才是真正被拦掉的。两个数不等是正常的 |
+| 🔴 日志刷 `检测到浏览器上下文损坏 -> 正在重启浏览器` + `重启失败(1/3)(2/3)(3/3)：launch_persistent_context: Target page, context…`，每轮耗时从 ~10 秒退化到 ~70 秒、**全部候选都取不到联系方式** | **僵尸 Edge 把 `.edge-auto/profile` 占死了**（每次失败的 `launch_persistent_context` 都留孤儿进程，越滚越多）。2026-09-29 实测：那一刻 `edge-auto` 归属的 msedge 高达 **21 个**（全量 33）。**此时那些「未取到」是假失败，不是真没号**。处置 = `"$PY" tools/kill_auto_edge.py` 杀孤儿（本次杀 15 个）——**采集器不用重启，几秒后自己就恢复**并跑完本轮 |
+| 🔴 `a_b_stream.py` 报 `PermissionError: [WinError 32] 另一个程序正在使用此文件: out/collect_s<N>.log`，或同一份 `out/a_b_stream.log` 里出现**两条参数不同的「A→B 串流调度」头**；或 `A 第 N 轮：退出码 1，耗时 **0.0 分**` 秒退 | **有第二个会话在并发跑同一条流水线**（违反 §3.4.1 单会话铁律）。后果：抢 `collect_s<N>.log`、抢 `.edge-auto/profile`、**并把列表接口推到 11001 限流**（09-29 14:34 实测）。定位用 `"$PY" .probe/list_pyprocs.py`（看命令行区分实例）；处置 = 按 PID 停掉其中一个（**保留参数与当日目标一致的那个**）。⚠️ 别把它误判成脚本 bug |
 | 🔴 A 阶段**成片**出现「「达人微信号」为遮罩态(需点小眼睛揭开) -> 跳过该达人」、`有效 0/N` | **先查 `MASK_SKIP`，不要先怀疑账号。** 2026-09-28 实测证伪了「账号降权/限权」的旧结论：占位态只是**未揭开**，**点小眼睛是能揭开的**；`MASK_SKIP=1` 会把几乎 100% 的微信号静默丢掉。见下方 2026-09-28 修正 |
 
 🔴 **2026-09-28 修正：遮罩态 ≠ 账号降权（09-24 / 09-28 两次误判的根因都是 `MASK_SKIP=1`）**
@@ -690,7 +692,16 @@ B 拍到 Edge → 误判 `risk_control` 整轮中止 / `not_found` 永久跳过�
    ⇒ 长跑建议自己按轮调度 `collect.py` + `OUT_TAG`，每轮跑完立刻
    `tools/merge_into_darens.py --from out/collect/darens_more<N>.json --only-with-contact`，别攒到最后。 |
 
-诊断探针（`.probe/`）：`probe_login.py`、`probe_api.py <类目>`、
+🔴 **`list_pyprocs.py`（2026-09-29 新增，排查「并发实例 / 谁在跑」的第一选择）**：
+列出所有 python 进程的 **PID / PPID / 完整命令行**。走 `NtQueryInformationProcess`（`ProcessCommandLineInformation=60`），
+只读无副作用。为什么必须有它：`tasklist` **看不到命令行**，而本机 `wmic` 已被移除、
+PowerShell 通道也可能无输出（09-29 实测两者都不可用）——那时唯一能区分
+「`a_b_stream.py`（无参=默认 b-cap 30）」和「`a_b_stream.py --b-baseline 370 --b-cap 50`」的办法就是它。
+```bash
+"$PY" .probe/list_pyprocs.py
+```
+
+诊断探针（`.probe/`）：`list_pyprocs.py`、`list_phone_darens.py`、`count_fuel.py`、`probe_login.py`、`probe_api.py <类目>`、
 `probe_daren.py [uid]`、`probe_product_price.py`（dump 带货分析整表含到手价）、
 `probe_filters.py <类目>`、`probe_douyin_id.py` / `probe_douyin_id2.py`（取抖音号，含串号证据）、
 `probe_square.py`（dump 达人广场页面结构，确认某控件**存不存在**）、

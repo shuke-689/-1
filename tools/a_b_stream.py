@@ -311,6 +311,7 @@ def main():
     rounds_without_new = 0
     rate_streak = 0                 # 连续命中「列表截断」的轮数（平台限流）
     crash_streak = 0                # 连续 A 运行异常（退出码 1，多为 Edge 残留占锁）的轮数
+    rc2_streak = 0                  # 连续退出码 2（筛选条件/payload 未通过）的轮数；**不等于淘空**
     empty_streak = {}               # key -> 该类目连续空转轮数（淘空判定）
     rate_hits_cat = {}              # key -> 本轮运行中该类目命中限流的次数（用于换类目轮换）
     EXHAUST_AT = 2                  # 某类目连续 2 轮 0 新号 -> 判淘空，换下一个类目
@@ -363,6 +364,20 @@ def main():
             if rc == 3:
                 log("  !! 退出码 3 = 登录失效 -> 整体中止（去 Edge 窗口登录后重跑本脚本）")
                 break
+            if rc == 2:
+                # 🔴 09-30 实测补丁：退出码 2 = 平台筛选条件/payload 校验没过
+                #    （见 RUNBOOK §1.6：冷却 45s 重试）。**绝不能**当「类目淘空」——
+                #    上午实测：个护轮一次 rc=2 就被记成 empty_streak 1/2，
+                #    再撞一次就会把好好的类目误判淘空、白换类目。
+                rc2_streak += 1
+                log("  !! A 退出码 2 = 平台筛选条件/payload 未通过（**不是**类目淘空）"
+                    "-> 冷却 45 秒重试本类目；连续 %d/3" % rc2_streak)
+                if rc2_streak >= 3:
+                    log("  !! 连续 3 轮退出码 2 -> 收工（先人工复核平台筛选条件是否被平台改名/改动）")
+                    break
+                time.sleep(45)
+                continue
+            rc2_streak = 0
             crash_streak = 0
             # 🔴 先分清「平台限流截断」还是「这个类目真淘空了」—— 09-28 实测踩过：
             #    截断护栏命中时 collect.py 会写 ratelimit<tag>.txt 并且**不产出名单**，
@@ -397,6 +412,7 @@ def main():
         rounds_without_new = 0
         rate_streak = 0
         crash_streak = 0
+        rc2_streak = 0
         empty_streak[key] = 0
 
         log("  A 本轮出**新微信号 %d 个**%s" % (
