@@ -98,6 +98,36 @@ def norm_text(s):
     return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
 
 
+# OCR 视觉易混字符折叠表（**只用于「有没有写进搜索框」的校验**，
+# 绝不改变真正写入/登记的微信号值）。
+_OCR_FOLD = str.maketrans({"i": "1", "l": "1", "o": "0"})
+
+
+def fold_ocr(s):
+    """折叠 OCR 易混字符：i/l/1 同类、o/0 同类。"""
+    return norm_text(s).translate(_OCR_FOLD)
+
+
+def id_similar(want, got, threshold=0.8):
+    """框内文字 got 是否就是期望写入的 want（搜索框写入校验）。
+
+    🔴 2026-10-01 实测（14:02 轮 10 个里 4 个被误判）：
+    本机 OCR 会把搜索框左侧**放大镜图标**读成 `Q`、把 `lmg` 读成 `Img`、
+    `xjj` 读成 `xij`、`ll-7oo` 读成 `I1-700` —— 严格 `in` 比对全部判「没写进去」，
+    候选被白判 `unknown`（下轮才重试，占着每天 30 个的额度）。
+    所以改成两级：先**严格包含**（原行为），不中再退化为**折叠 + 相似度**。
+    只放宽到「高度相似」（默认 0.8）为止；真乱码仍判失败
+    （实测 `nwx99999` -> `66666xMu` 相似度远低于阈值，照样判失败 -> unknown）。
+    """
+    w, g = fold_ocr(want), fold_ocr(got)
+    if not w or not g:
+        return False
+    if w in g:
+        return True
+    import difflib
+    return difflib.SequenceMatcher(None, w, g).ratio() >= threshold
+
+
 FREEZE_LIMIT = 2      # 连续相同几次即判定冻结（含本次共 3 张结果图）
 
 
@@ -368,13 +398,20 @@ class WeChat:
             w.paste_text(text)
             # ⚠️ 2026-09-23：本机（远程桌面 3840x2160）输入/重绘延迟可达 1~2 秒，
             #    固定 sleep(1.0) 会把「其实写进去了」误判成失败；改成轮询最多等 6 秒。
+            # ⚠️ 2026-10-01：比对改用 id_similar()（严格包含 -> 折叠+相似度），
+            #    否则 OCR 把放大镜读成 Q / l 读成 I 就会把成功写入误判成失败。
             got = ""
+            ok = False
             for _ in range(12):
                 time.sleep(0.5)
                 got = self.box_text()
-                if want and want in norm_text(got):
+                if id_similar(text, got):
+                    ok = True
                     break
-            if want and want in norm_text(got):
+            if ok:
+                if want not in norm_text(got):
+                    log("  · 搜索框 OCR 严格比对未中，模糊校验通过（期望 %s / 读到 %r）"
+                        % (text, got))
                 break
             log("  ! 搜索框写入校验失败（期望 %s / 框内实际 %r）第 %d 次"
                 % (text, got, attempt))

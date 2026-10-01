@@ -1369,6 +1369,13 @@ node out/_jscheck/test_find_close.js          # 桩 DOM 跑行为测试
    （标题/按钮文字）；拿不到按钮时退化为点「搜索框几何位置」。**与框内文字长短完全无关**。
 2. `search()` 粘贴后用 `box_text()` **轮询校验**（0.5s × 12，上限 6s；本机延迟实测 1~2s，
    固定 sleep 会误判）→ 失败重试 1 次 → 仍失败 **返回 False** → 调用方判 `unknown`，**绝不写 not_found**。
+   🔴 **比对用 `id_similar()`（2026-10-01 修）**：先严格包含（原行为），不中再退化为
+   **OCR 易混字折叠（i/l/1、o/0）+ 相似度 ≥0.8**。
+   起因：14:02 轮 10 个里 **4 个**被判「写入校验失败」→ `unknown`（禾禾/哈尼～/Irene/雯雯子），
+   实测 OCR 把搜索框左侧**放大镜图标读成 `Q`**、`lmg`→`Img`、`xjj`→`xij`、`ll-7oo`→`I1-700`
+   —— 其实都写进去了，严格 `in` 比对把成功当失败，白占当天 30 个额度。
+   安全边界保留：**空框 / 别的微信号 / 真乱码**（`nwx99999`→`66666xMu`）**依旧判失败** → `unknown`。
+   单测见 `.probe/test_wechat_guard.py` 第 12 组（7 项，含 3 个真实误读 + 3 个反例）。
 3. `not_found` 必须**独立复核一次**（再搜一遍，两次都搜不到才认定），否则判 `unknown`。
    额外：`multi_frame_frozen()` —— 同轮 ≥5 个达人而结果图指纹去重 **≤2 种** ⇒ 判冻结帧
    （原 `freeze_step()` 的「连续 3 张相同」**抓不到 2 帧交替**）。
@@ -1385,8 +1392,8 @@ node out/_jscheck/test_find_close.js          # 桩 DOM 跑行为测试
 3. 审计：拿「上一次的备份」当基线，diff 出**本轮新增的 not_found**，逐条 `probe-search` 复测，
    能搜到的一律回滚。本轮实测：新增 4 条里 1 条误判。
 
-**单测**：`.probe/test_wechat_guard.py`（**26 项**，含 `freeze_step` / `multi_frame_frozen` /
-`norm_text` / `abnormal` 状态）。
+**单测**：`.probe/test_wechat_guard.py`（**33 项**，含 `freeze_step` / `multi_frame_frozen` /
+`norm_text` / `id_similar`（写入校验模糊比对）/ `abnormal` 状态）。
 
 ---
 

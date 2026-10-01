@@ -121,8 +121,18 @@ check("abnormal 计入已完成(跳过)",
 check("abnormal 有中文标签", W.STATUS_LABEL.get("abnormal"), "账号状态异常(跳过)")
 check("标题不会被当成搜索框", "添加朋友" in W.WeChat.BOX_LABELS, True)
 
+# 12) 搜索框写入校验：OCR 误读不能把「其实写进去了」判成失败（2026-10-01 修）
+#     —— 14:02 轮 10 个里 4 个被这条误判成 unknown，白占当天 30 个额度。
+check("写入校验·放大镜读成Q+l读成I", W.id_similar("lmg1223221", "Q Img1223221"), True)
+check("写入校验·j读成i", W.id_similar("xjj606060", "xij606060"), True)
+check("写入校验·l/o读成I/0", W.id_similar("ll-7oo", "Q I1-700"), True)
+check("写入校验·严格命中", W.id_similar("dan47277288", "dan47277288"), True)
+check("写入校验·空框仍判失败", W.id_similar("lmg1223221", ""), False)
+check("写入校验·别的号不误判", W.id_similar("lmg1223221", "xjj606060"), False)
+check("写入校验·真乱码仍判失败", W.id_similar("nwx99999", "66666xMu"), False)
+
 print()
 if FAIL:
     print("!! 失败 %d 项：%s" % (len(FAIL), " / ".join(FAIL)))
     sys.exit(1)
-print("全部通过（%d 项）" % 26)
+print("全部通过（%d 项）" % 33)
