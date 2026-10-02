@@ -1471,6 +1471,18 @@ SKIP_DOUYIN_ID=1 "$PY" tools/a_b_stream.py            # 想快：跳过抖音号
 3. **本轮内成片 11001 也算「撞限流」**：脚本对单次 11001 会自退避 90 秒继续跑，
    但若一轮里反复吃退避（2026-09-30 第 3 轮：13 次退避、有效数卡在 2/10、耗时 >26 分钟）⇒
    按风控铁律**停 A**（未落盘的那点成果不算损失，达人下次会重采）。
+4. 🔴 **A 在 `save_state()` 之前中止（最常见：登录失效退出码 3）⇒ `daily_state.json` 会「滞留在昨天」**
+   （`date` 还是前一天、`sent_start` 还是前一天的旧值）。此后**同一天**再跑 `a_b_stream.py`
+   且**不传 `--b-baseline`**：`load_state()` 判 `date != today` → 重置 → `sent_start = sent_total()`
+   = **当前** sent 累计 → 「当天已发」被算成 **0** ⇒ **会再发满 30 个（超发）**。
+   - 2026-10-02 实测：早班 09:00 跑过 B（sent 427→435）、A 因登录失效 rc=3 中止未落盘；
+     14:00 午后来跑时 state 仍是 `10-01 / sent_start=409`。**正确当天基线 = 427**（不是 435）。
+   - 处置（二选一，任一即可）：
+     ① 传 `--b-baseline <当天首次运行时的 sent 总数>`（当天首次运行前**先 `wechat_add.py status` 记下 sent 累计**）；
+     ② 或当天**首次**不传基线跑完后，若发现 state 的 `date` 不是今天（说明 A 早退），
+        用 Python **防御性改写** state 的 `date/sent_start`（`sent_start` = 首次运行前的 sent 累计）。
+   - 更稳的做法：**当天第一次动手前，先记下 `sent_total()`**（`wechat_add.py status` 的「台账」sent 数），
+     这就是当天的 `sent_start`；之后任何重跑都拿它当 `--b-baseline`。
 
 ---
 
