@@ -96,6 +96,14 @@ Playwright 启的 msedge **不会**跟着退出。
 4. 但杀完也不能**立刻**启动：Windows 侧 profile 锁还要几秒才释放。
    → 折中做法：杀掉后**轮询到进程数归 0（约 1-3 秒）就立刻启动**。
 
+5. 🔴 **`login.py` 绝不能后台/nohup 跑（2026-10-02 实测）**：后台 shell 回收时
+   python 被杀、**它启的 headful msedge 却存活** → 持续占住 profile；
+   之后每次重试都报「正在现有浏览器会话中打开」秒退，且每次失败还可能再漏几个
+   msedge（实测一路涨到 19 个）。另外秒退会在 `.edge-auto/profile/` 留下**陈旧
+   `lockfile`**（0 字节），进程清零后它仍会挡启动 → 清完进程后检查并删掉它，
+   再**前台**重跑 `login.py`。诊断口诀：`kill_auto_edge.py --list` 归零 +
+   `ls .edge-auto/profile/lockfile` 不存在，才允许启动。
+
 **做法（一行搞定）**
 
 ```bash
@@ -103,7 +111,8 @@ bash tools/kill_edge.sh && "$PY" tools/collect_more.py
 ```
 
 `tools/kill_edge.sh` 就是干这个的：定位「命令行含 `.edge-auto` 的 msedge」→
-`taskkill /F /T /PID`（**单斜杠**）→ 轮询归零 → 打印剩余数 → **立即返回**
+`taskkill /F /T /PID`（经 python 执行、不经 shell，不受斜杠改写影响；bash 里手写
+必须用**双斜杠** `//F //PID`，见本节坑 1）→ 轮询归零 → 打印剩余数 → **立即返回**
 （脚本里**不要**加 sleep）。核心逻辑在 `tools/kill_auto_edge.py`，bash 与
 `collect_more.py` 共用同一份，别再各自写一份。
 
